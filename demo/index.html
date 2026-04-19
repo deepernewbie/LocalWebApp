@@ -1,0 +1,236 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Demo App</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+      background: #0f172a;
+      color: #f1f5f9;
+      min-height: 100vh;
+    }
+    header {
+      background: linear-gradient(135deg, #1a73e8, #0d47a1);
+      padding: 24px 16px;
+      text-align: center;
+    }
+    header h1 { font-size: 24px; font-weight: 700; }
+    header p { font-size: 13px; opacity: 0.8; margin-top: 4px; }
+    .badge {
+      display: inline-block;
+      background: #4caf50;
+      color: white;
+      font-size: 11px;
+      padding: 2px 10px;
+      border-radius: 99px;
+      margin-top: 8px;
+    }
+    .section { padding: 16px; }
+    .card {
+      background: #1e293b;
+      border-radius: 16px;
+      padding: 16px;
+      margin-bottom: 12px;
+    }
+    .card h2 { font-size: 15px; color: #94a3b8; margin-bottom: 12px; text-transform: uppercase; letter-spacing: 1px; }
+    button {
+      width: 100%;
+      padding: 12px;
+      border: none;
+      border-radius: 10px;
+      font-size: 15px;
+      font-weight: 600;
+      cursor: pointer;
+      margin-bottom: 8px;
+      transition: opacity 0.2s;
+    }
+    button:active { opacity: 0.7; }
+    .btn-blue { background: #1a73e8; color: white; }
+    .btn-green { background: #4caf50; color: white; }
+    .btn-purple { background: #7c3aed; color: white; }
+    .btn-red { background: #ef4444; color: white; }
+    .output {
+      background: #0f172a;
+      border-radius: 10px;
+      padding: 12px;
+      font-size: 13px;
+      color: #4ade80;
+      font-family: monospace;
+      min-height: 48px;
+      margin-top: 8px;
+      word-break: break-all;
+    }
+    .counter-display {
+      font-size: 64px;
+      font-weight: 800;
+      text-align: center;
+      color: #1a73e8;
+      padding: 8px 0;
+    }
+    .counter-row {
+      display: flex;
+      gap: 8px;
+    }
+    .counter-row button { flex: 1; }
+    input {
+      width: 100%;
+      padding: 10px 12px;
+      border-radius: 10px;
+      border: 1px solid #334155;
+      background: #0f172a;
+      color: #f1f5f9;
+      font-size: 15px;
+      margin-bottom: 8px;
+    }
+    .note-list { margin-top: 8px; }
+    .note-item {
+      background: #0f172a;
+      border-radius: 8px;
+      padding: 10px 12px;
+      margin-bottom: 6px;
+      font-size: 14px;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+    }
+    .note-item span { color: #94a3b8; font-size: 11px; cursor: pointer; }
+    .time { text-align: center; font-size: 40px; font-weight: 700; color: #f1f5f9; letter-spacing: 2px; }
+    .date { text-align: center; font-size: 14px; color: #64748b; margin-top: 4px; }
+  </style>
+</head>
+<body>
+
+<header>
+  <h1>🚀 Local Web App Runner</h1>
+  <p>Your web app running natively on Android</p>
+  <div class="badge" id="platformBadge">Detecting...</div>
+</header>
+
+<div class="section">
+
+  <!-- Clock -->
+  <div class="card">
+    <h2>⏰ Live Clock</h2>
+    <div class="time" id="clock">--:--:--</div>
+    <div class="date" id="dateDisplay"></div>
+  </div>
+
+  <!-- Counter -->
+  <div class="card">
+    <h2>🔢 Counter</h2>
+    <div class="counter-display" id="counterVal">0</div>
+    <div class="counter-row">
+      <button class="btn-red" onclick="changeCount(-1)">− 1</button>
+      <button class="btn-blue" onclick="changeCount(1)">+ 1</button>
+    </div>
+    <button class="btn-purple" onclick="resetCount()">Reset</button>
+  </div>
+
+  <!-- Notes with localStorage -->
+  <div class="card">
+    <h2>📝 Notes (saved locally)</h2>
+    <input type="text" id="noteInput" placeholder="Type a note..." />
+    <button class="btn-green" onclick="addNote()">Save Note</button>
+    <div class="note-list" id="noteList"></div>
+  </div>
+
+  <!-- Android Bridge -->
+  <div class="card">
+    <h2>🤖 Android Bridge</h2>
+    <button class="btn-blue" onclick="doToast()">Show Toast</button>
+    <button class="btn-purple" onclick="doShare()">Share This App</button>
+    <div class="output" id="bridgeOutput">Tap a button...</div>
+  </div>
+
+</div>
+
+<script>
+  // Platform detection
+  const isAndroid = typeof Android !== 'undefined';
+  document.getElementById('platformBadge').textContent =
+    isAndroid ? '✅ Running as Native Android App' : '🌐 Running in Browser';
+
+  // Clock
+  function updateClock() {
+    const now = new Date();
+    document.getElementById('clock').textContent =
+      now.toLocaleTimeString();
+    document.getElementById('dateDisplay').textContent =
+      now.toLocaleDateString(undefined, { weekday:'long', year:'numeric', month:'long', day:'numeric' });
+  }
+  setInterval(updateClock, 1000);
+  updateClock();
+
+  // Counter with localStorage
+  let count = parseInt(localStorage.getItem('counter') || '0');
+  document.getElementById('counterVal').textContent = count;
+
+  function changeCount(n) {
+    count += n;
+    document.getElementById('counterVal').textContent = count;
+    localStorage.setItem('counter', count);
+  }
+  function resetCount() {
+    count = 0;
+    document.getElementById('counterVal').textContent = 0;
+    localStorage.setItem('counter', 0);
+  }
+
+  // Notes
+  function getNotes() {
+    return JSON.parse(localStorage.getItem('notes') || '[]');
+  }
+  function renderNotes() {
+    const notes = getNotes();
+    const list = document.getElementById('noteList');
+    if (notes.length === 0) {
+      list.innerHTML = '<div style="color:#475569;font-size:13px;padding:8px">No notes yet</div>';
+      return;
+    }
+    list.innerHTML = notes.map((n, i) =>
+      `<div class="note-item">${n.text}<span onclick="deleteNote(${i})">✕</span></div>`
+    ).join('');
+  }
+  function addNote() {
+    const input = document.getElementById('noteInput');
+    const text = input.value.trim();
+    if (!text) return;
+    const notes = getNotes();
+    notes.unshift({ text, time: Date.now() });
+    localStorage.setItem('notes', JSON.stringify(notes.slice(0, 20)));
+    input.value = '';
+    renderNotes();
+  }
+  function deleteNote(i) {
+    const notes = getNotes();
+    notes.splice(i, 1);
+    localStorage.setItem('notes', JSON.stringify(notes));
+    renderNotes();
+  }
+  renderNotes();
+
+  // Android bridge
+  function doToast() {
+    if (isAndroid) {
+      Android.toast('Hello from your web app! 👋');
+      document.getElementById('bridgeOutput').textContent = '✅ Toast shown via Android bridge';
+    } else {
+      alert('Hello! (browser fallback)');
+      document.getElementById('bridgeOutput').textContent = '🌐 alert() used (browser fallback)';
+    }
+  }
+  function doShare() {
+    if (isAndroid) {
+      Android.share('Check out Local Web App Runner — run any web app as a native Android app!');
+      document.getElementById('bridgeOutput').textContent = '✅ Share sheet opened';
+    } else {
+      document.getElementById('bridgeOutput').textContent = '🌐 Share not available in browser';
+    }
+  }
+</script>
+
+</body>
+</html>
