@@ -1,12 +1,12 @@
 package com.localwebapp
 
 import android.annotation.SuppressLint
-import android.app.Activity
 import android.content.ContentResolver
 import android.content.Intent
 import android.graphics.Bitmap
 import android.net.Uri
 import android.os.Bundle
+import android.util.Base64
 import android.view.KeyEvent
 import android.view.LayoutInflater
 import android.view.View
@@ -24,6 +24,7 @@ import androidx.recyclerview.widget.RecyclerView
 import com.google.android.material.floatingactionbutton.FloatingActionButton
 import org.json.JSONArray
 import org.json.JSONObject
+import java.io.File
 import java.io.OutputStream
 import java.net.ServerSocket
 import java.net.URLDecoder
@@ -185,7 +186,6 @@ class WebAppActivity : AppCompatActivity() {
     companion object {
         const val EXTRA_URI = "extra_uri"
         const val EXTRA_TITLE = "extra_title"
-        private const val FILE_CHOOSER_REQUEST = 100
     }
 
     private lateinit var webView: WebView
@@ -196,40 +196,31 @@ class WebAppActivity : AppCompatActivity() {
     private var pendingPermissionRequest: PermissionRequest? = null
     private var filePathCallback: ValueCallback<Array<Uri>>? = null
 
-    // Single launcher for all dangerous permissions
     private val permissionLauncher =
         registerForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) { results ->
             val allGranted = results.values.all { it }
-            if (allGranted) {
-                pendingPermissionRequest?.grant(pendingPermissionRequest!!.resources)
-            } else {
-                pendingPermissionRequest?.deny()
-            }
+            if (allGranted) pendingPermissionRequest?.grant(pendingPermissionRequest!!.resources)
+            else pendingPermissionRequest?.deny()
             pendingPermissionRequest = null
         }
 
-    // File chooser launcher
     private val fileChooserLauncher =
         registerForActivityResult(ActivityResultContracts.GetMultipleContents()) { uris ->
             filePathCallback?.onReceiveValue(uris.toTypedArray())
             filePathCallback = null
         }
 
-    // Image capture launcher
     private val imageCaptureUri by lazy {
         androidx.core.content.FileProvider.getUriForFile(
-            this,
-            "${packageName}.fileprovider",
-            java.io.File(cacheDir, "capture_${System.currentTimeMillis()}.jpg")
+            this, "${packageName}.fileprovider",
+            File(cacheDir, "capture_${System.currentTimeMillis()}.jpg")
         )
     }
+
     private val imageCaptureCallback by lazy {
         registerForActivityResult(ActivityResultContracts.TakePicture()) { success ->
-            if (success) {
-                filePathCallback?.onReceiveValue(arrayOf(imageCaptureUri))
-            } else {
-                filePathCallback?.onReceiveValue(null)
-            }
+            if (success) filePathCallback?.onReceiveValue(arrayOf(imageCaptureUri))
+            else filePathCallback?.onReceiveValue(null)
             filePathCallback = null
         }
     }
@@ -274,13 +265,16 @@ class WebAppActivity : AppCompatActivity() {
             setSupportZoom(true)
             builtInZoomControls = true
             displayZoomControls = false
-            // Allow autoplay audio/video without user gesture
             mediaPlaybackRequiresUserGesture = false
             mixedContentMode = WebSettings.MIXED_CONTENT_COMPATIBILITY_MODE
         }
 
-        // Android JS bridge
+        // Base models directory in app's private files
+        val modelsDir = File(filesDir, "models").also { it.mkdirs() }
+
         webView.addJavascriptInterface(object : Any() {
+
+            // ── Basic bridge ──────────────────────────────────────────
             @JavascriptInterface
             fun toast(msg: String) = runOnUiThread {
                 Toast.makeText(this@WebAppActivity, msg, Toast.LENGTH_SHORT).show()
@@ -309,6 +303,105 @@ class WebAppActivity : AppCompatActivity() {
                     @Suppress("DEPRECATION") v.vibrate(100)
                 }
             }
+
+            // ── File bridge (for QuizLens model storage) ──────────────
+
+            /**
+             * Write a base64-encoded file to app private storage.
+             * path is relative, e.g. "models/SmolVLM/onnx/decoder.onnx"
+             * Returns "ok" or "error: <message>"
+             */
+            @JavascriptInterface
+            fun writeFile(path: String, base64Data: String): String {
+                return try {
+                    val file = File(filesDir, sanitizePath(path))
+                    file.parentFile?.mkdirs()
+                    val bytes = Base64.decode(base64Data, Base64.DEFAULT)
+                    file.writeBytes(bytes)
+                    "ok"
+                } catch (e: Exception) {
+                    "error: ${e.message}"
+                }
+            }
+
+            /**
+             * Check if a file exists.
+             * Returns "true" or "false"
+             */
+            @JavascriptInterface
+            fun fileExists(path: String): String {
+                return try {
+                    File(filesDir, sanitizePath(path)).exists().toString()
+                } catch (e: Exception) {
+                    "false"
+                }
+            }
+
+            /**
+             * List files in a directory.
+             * Returns JSON array of filenames, e.g. ["decoder.onnx","config.json"]
+             * Returns "[]" if directory doesn't exist or on error.
+             */
+            @JavascriptInterface
+            fun listDir(path: String): String {
+                return try {
+                    val dir = File(filesDir, sanitizePath(path))
+                    if (!dir.exists() || !dir.isDirectory) return "[]"
+                    val arr = JSONArray()
+                    dir.list()?.forEach { arr.put(it) }
+                    arr.toString()
+                } catch (e: Exception) {
+                    "[]"
+                }
+            }
+
+            /**
+             * Read a file and return it as base64.
+             * Used by QuizLens to load cached model files back into memory.
+             * Returns base64 string or "error: <message>"
+             */
+            @JavascriptInterface
+            fun readFile(path: String): String {
+                return try {
+                    val file = File(filesDir, sanitizePath(path))
+                    if (!file.exists()) return "error: not found"
+                    Base64.encodeToString(file.readBytes(), Base64.DEFAULT)
+                } catch (e: Exception) {
+                    "error: ${e.message}"
+                }
+            }
+
+            /**
+             * Delete a file or directory recursively.
+             * Returns "ok" or "error: <message>"
+             */
+            @JavascriptInterface
+            fun deleteFile(path: String): String {
+                return try {
+                    File(filesDir, sanitizePath(path)).deleteRecursively()
+                    "ok"
+                } catch (e: Exception) {
+                    "error: ${e.message}"
+                }
+            }
+
+            /**
+             * Get available storage in MB
+             */
+            @JavascriptInterface
+            fun getFreeMB(): String {
+                return try {
+                    val stat = android.os.StatFs(filesDir.path)
+                    val free = stat.availableBlocksLong * stat.blockSizeLong / 1048576
+                    free.toString()
+                } catch (e: Exception) { "0" }
+            }
+
+            // Prevent path traversal attacks
+            private fun sanitizePath(path: String): String {
+                return path.replace("..", "").trimStart('/')
+            }
+
         }, "Android")
 
         webView.webViewClient = object : WebViewClient() {
@@ -333,7 +426,6 @@ class WebAppActivity : AppCompatActivity() {
             ): Boolean {
                 val url = req.url.toString()
                 if (url.startsWith("http://localhost")) return false
-                // Handle mailto, tel links natively
                 if (url.startsWith("mailto:") || url.startsWith("tel:")) {
                     startActivity(Intent(Intent.ACTION_VIEW, req.url))
                     return true
@@ -345,7 +437,6 @@ class WebAppActivity : AppCompatActivity() {
 
         webView.webChromeClient = object : WebChromeClient() {
 
-            // ── Progress & title ──────────────────────────────────────
             override fun onProgressChanged(v: WebView, p: Int) {
                 progressBar.progress = p
                 if (p == 100) progressBar.visibility = View.GONE
@@ -359,7 +450,6 @@ class WebAppActivity : AppCompatActivity() {
                 return true
             }
 
-            // ── JS Dialogs ────────────────────────────────────────────
             override fun onJsAlert(
                 view: WebView, url: String, message: String, result: JsResult
             ): Boolean {
@@ -397,39 +487,32 @@ class WebAppActivity : AppCompatActivity() {
                 return true
             }
 
-            // ── Camera / Mic / Geolocation permissions ────────────────
             override fun onPermissionRequest(request: PermissionRequest) {
                 val androidPerms = mutableListOf<String>()
-                if (request.resources.contains(PermissionRequest.RESOURCE_VIDEO_CAPTURE)) {
+                if (request.resources.contains(PermissionRequest.RESOURCE_VIDEO_CAPTURE))
                     androidPerms.add(android.Manifest.permission.CAMERA)
-                }
-                if (request.resources.contains(PermissionRequest.RESOURCE_AUDIO_CAPTURE)) {
+                if (request.resources.contains(PermissionRequest.RESOURCE_AUDIO_CAPTURE))
                     androidPerms.add(android.Manifest.permission.RECORD_AUDIO)
-                }
                 if (androidPerms.isEmpty()) {
-                    request.grant(request.resources)
-                    return
+                    request.grant(request.resources); return
                 }
-                val allAlreadyGranted = androidPerms.all {
+                val allGranted = androidPerms.all {
                     checkSelfPermission(it) ==
                         android.content.pm.PackageManager.PERMISSION_GRANTED
                 }
-                if (allAlreadyGranted) {
-                    request.grant(request.resources)
-                } else {
+                if (allGranted) request.grant(request.resources)
+                else {
                     pendingPermissionRequest = request
                     permissionLauncher.launch(androidPerms.toTypedArray())
                 }
             }
 
-            // ── Geolocation ───────────────────────────────────────────
             override fun onGeolocationPermissionsShowPrompt(
-                origin: String,
-                callback: GeolocationPermissions.Callback
+                origin: String, callback: GeolocationPermissions.Callback
             ) {
-                val fineLocation = android.Manifest.permission.ACCESS_FINE_LOCATION
-                val coarseLocation = android.Manifest.permission.ACCESS_COARSE_LOCATION
-                if (checkSelfPermission(fineLocation) ==
+                val fine = android.Manifest.permission.ACCESS_FINE_LOCATION
+                val coarse = android.Manifest.permission.ACCESS_COARSE_LOCATION
+                if (checkSelfPermission(fine) ==
                     android.content.pm.PackageManager.PERMISSION_GRANTED) {
                     callback.invoke(origin, true, false)
                 } else {
@@ -437,9 +520,7 @@ class WebAppActivity : AppCompatActivity() {
                         .setTitle("Location Access")
                         .setMessage("This app wants to access your location.")
                         .setPositiveButton("Allow") { _, _ ->
-                            permissionLauncher.launch(
-                                arrayOf(fineLocation, coarseLocation)
-                            )
+                            permissionLauncher.launch(arrayOf(fine, coarse))
                             callback.invoke(origin, true, false)
                         }
                         .setNegativeButton("Deny") { _, _ ->
@@ -449,7 +530,6 @@ class WebAppActivity : AppCompatActivity() {
                 }
             }
 
-            // ── File chooser (input type=file) ────────────────────────
             override fun onShowFileChooser(
                 webView: WebView,
                 callback: ValueCallback<Array<Uri>>,
@@ -459,15 +539,10 @@ class WebAppActivity : AppCompatActivity() {
                 filePathCallback = callback
                 val acceptTypes = params.acceptTypes.joinToString(",")
                 val isImage = acceptTypes.contains("image")
-                val isCapture = params.isCaptureEnabled
-                if (isImage && isCapture) {
-                    // Use camera directly
-                    try {
-                        imageCaptureCallback.launch(imageCaptureUri)
-                        return true
-                    } catch (e: Exception) { /* fall through to picker */ }
+                if (isImage && params.isCaptureEnabled) {
+                    try { imageCaptureCallback.launch(imageCaptureUri); return true }
+                    catch (e: Exception) {}
                 }
-                // Show dialog: pick from gallery or take photo
                 if (isImage) {
                     AlertDialog.Builder(this@WebAppActivity)
                         .setTitle("Get Image")
@@ -496,7 +571,6 @@ class WebAppActivity : AppCompatActivity() {
                 return true
             }
 
-            // ── Fullscreen video ──────────────────────────────────────
             private var customView: View? = null
             private var customViewCallback: CustomViewCallback? = null
 
@@ -517,8 +591,7 @@ class WebAppActivity : AppCompatActivity() {
             }
 
             override fun onHideCustomView() {
-                (window.decorView as android.widget.FrameLayout)
-                    .removeView(customView)
+                (window.decorView as android.widget.FrameLayout).removeView(customView)
                 customView = null
                 customViewCallback?.onCustomViewHidden()
                 customViewCallback = null
@@ -529,15 +602,13 @@ class WebAppActivity : AppCompatActivity() {
 
     override fun onKeyDown(keyCode: Int, event: KeyEvent?): Boolean {
         if (keyCode == KeyEvent.KEYCODE_BACK && webView.canGoBack()) {
-            webView.goBack()
-            return true
+            webView.goBack(); return true
         }
         return super.onKeyDown(keyCode, event)
     }
 
     override fun onSupportNavigateUp(): Boolean {
-        onBackPressedDispatcher.onBackPressed()
-        return true
+        onBackPressedDispatcher.onBackPressed(); return true
     }
 
     override fun onDestroy() {
