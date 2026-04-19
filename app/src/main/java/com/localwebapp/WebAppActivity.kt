@@ -51,10 +51,10 @@ class WebAppActivity : AppCompatActivity() {
 
         setupWebView()
 
-        server = SimpleServer(contentResolver, folderUri).also {
-            it.start()
-            webView.loadUrl("http://localhost:${it.port}/")
-        }
+        val s = SimpleServer(contentResolver, folderUri)
+        server = s
+        s.start()
+        webView.loadUrl("http://localhost:${s.port}/")
     }
 
     @SuppressLint("SetJavaScriptEnabled")
@@ -74,15 +74,19 @@ class WebAppActivity : AppCompatActivity() {
         }
 
         webView.addJavascriptInterface(object : Any() {
-            @JavascriptInterface fun toast(msg: String) =
-                runOnUiThread { Toast.makeText(this@WebAppActivity, msg, Toast.LENGTH_SHORT).show() }
+            @JavascriptInterface
+            fun toast(msg: String) = runOnUiThread {
+                Toast.makeText(this@WebAppActivity, msg, Toast.LENGTH_SHORT).show()
+            }
             @JavascriptInterface fun log(msg: String) = android.util.Log.d("WebApp", msg)
             @JavascriptInterface fun isNativeApp() = true
             @JavascriptInterface fun getPlatform() = "android"
             @JavascriptInterface fun share(text: String) = runOnUiThread {
                 startActivity(Intent.createChooser(
-                    Intent(Intent.ACTION_SEND).apply { type = "text/plain"; putExtra(Intent.EXTRA_TEXT, text) },
-                    "Share"
+                    Intent(Intent.ACTION_SEND).apply {
+                        type = "text/plain"
+                        putExtra(Intent.EXTRA_TEXT, text)
+                    }, "Share"
                 ))
             }
         }, "Android")
@@ -115,46 +119,71 @@ class WebAppActivity : AppCompatActivity() {
                 progressBar.progress = p
                 if (p == 100) progressBar.visibility = View.GONE
             }
-            override fun onReceivedTitle(v: WebView, t: String) { supportActionBar?.title = t }
+            override fun onReceivedTitle(v: WebView, t: String) {
+                supportActionBar?.title = t
+            }
             override fun onConsoleMessage(m: ConsoleMessage): Boolean {
-                android.util.Log.d("WebApp-JS", m.message()); return true
+                android.util.Log.d("WebApp-JS", m.message())
+                return true
             }
         }
     }
 
     override fun onKeyDown(keyCode: Int, event: KeyEvent?): Boolean {
         if (keyCode == KeyEvent.KEYCODE_BACK && webView.canGoBack()) {
-            webView.goBack(); return true
+            webView.goBack()
+            return true
         }
         return super.onKeyDown(keyCode, event)
     }
 
-    override fun onSupportNavigateUp(): Boolean { onBackPressedDispatcher.onBackPressed(); return true }
-    override fun onDestroy() { super.onDestroy(); server?.stop(); webView.destroy() }
+    override fun onSupportNavigateUp(): Boolean {
+        onBackPressedDispatcher.onBackPressed()
+        return true
+    }
+
+    override fun onDestroy() {
+        super.onDestroy()
+        server?.stop()
+        webView.destroy()
+    }
+
     override fun onPause() { super.onPause(); webView.onPause() }
     override fun onResume() { super.onResume(); webView.onResume() }
 }
 
-class SimpleServer(private val resolver: ContentResolver, private val rootUri: Uri) {
-    private var socket: ServerSocket? = null
-    var port = 0; private set
-    private val threadPool = Executors.newCachedThreadPool()
+class SimpleServer(
+    private val resolver: ContentResolver,
+    private val rootUri: Uri
+) {
+    private var serverSocket: ServerSocket? = null
+    var port = 0
+        private set
+    private val executor = Executors.newCachedThreadPool()
     @Volatile private var active = false
 
     fun start() {
-        socket = ServerSocket(0).also { port = it.localPort }
+        serverSocket = ServerSocket(0).also { port = it.localPort }
         active = true
-        threadPool.submit {
+        executor.submit {
             while (active) {
                 try {
-                    val client = socket!!.accept()
-                    threadPool.submit { try { handle(client) } finally { client.close() } }
-                } catch (e: Exception) { if (active) e.printStackTrace() }
+                    val client = serverSocket!!.accept()
+                    executor.submit {
+                        try { handle(client) } finally { client.close() }
+                    }
+                } catch (e: Exception) {
+                    if (active) e.printStackTrace()
+                }
             }
         }
     }
 
-    fun stop() { active = false; try { socket?.close() } catch (e: Exception) {} threadPool.shutdownNow() }
+    fun stop() {
+        active = false
+        try { serverSocket?.close() } catch (e: Exception) {}
+        executor.shutdownNow()
+    }
 
     private fun handle(s: java.net.Socket) {
         val reader = s.inputStream.bufferedReader(Charsets.ISO_8859_1)
@@ -163,44 +192,67 @@ class SimpleServer(private val resolver: ContentResolver, private val rootUri: U
         val parts = line.trim().split(" ")
         if (parts.size < 2) return
         var path = URLDecoder.decode(parts[1].substringBefore("?"), "UTF-8")
-        do { val h = reader.readLine() ?: break } while (h.isNotBlank())
+        do {
+            val h = reader.readLine() ?: break
+            if (h.isBlank()) break
+        } while (true)
         if (path == "/" || path.isEmpty()) path = "/index.html"
-        val segments = path.trimStart('/').split("/").filter { it.isNotEmpty() && it != ".." }
+        val segments = path.trimStart('/').split("/")
+            .filter { it.isNotEmpty() && it != ".." }
         val file = resolve(segments)
         when {
             file == null || !file.exists() -> {
                 val idx = resolve(listOf("index.html"))
                 if (idx != null && idx.exists()) serveFile(out, idx) else send404(out)
             }
-            file.isDirectory -> { val idx = file.findFile("index.html"); if (idx != null) serveFile(out, idx) else send404(out) }
+            file.isDirectory -> {
+                val idx = file.findFile("index.html")
+                if (idx != null) serveFile(out, idx) else send404(out)
+            }
             else -> serveFile(out, file)
         }
     }
 
     private fun resolve(segments: List<String>): DocumentFile? {
         val ctx = try {
-            val f = ContentResolver::class.java.getDeclaredField("mContext").apply { isAccessible = true }
+            val f = ContentResolver::class.java.getDeclaredField("mContext")
+            f.isAccessible = true
             f.get(resolver) as android.content.Context
         } catch (e: Exception) { return null }
         var node = DocumentFile.fromTreeUri(ctx, rootUri) ?: return null
-        for (seg in segments) node = node.findFile(seg) ?: return null
+        for (seg in segments) {
+            node = node.findFile(seg) ?: return null
+        }
         return node
     }
 
     private fun serveFile(out: OutputStream, file: DocumentFile) {
-        val bytes = resolver.openInputStream(file.uri)?.use { it.readBytes() } ?: run { send404(out); return }
-        val mime = mime(file.name ?: "")
-        val header = "HTTP/1.1 200 OK\r\nContent-Type: $mime\r\nContent-Length: ${bytes.size}\r\nAccess-Control-Allow-Origin: *\r\nCache-Control: no-cache\r\n\r\n"
-        out.write(header.toByteArray(Charsets.ISO_8859_1)); out.write(bytes); out.flush()
+        val bytes = resolver.openInputStream(file.uri)?.use { it.readBytes() }
+            ?: run { send404(out); return }
+        val mime = getMime(file.name ?: "")
+        val header = "HTTP/1.1 200 OK\r\n" +
+            "Content-Type: $mime\r\n" +
+            "Content-Length: ${bytes.size}\r\n" +
+            "Access-Control-Allow-Origin: *\r\n" +
+            "Cache-Control: no-cache\r\n\r\n"
+        out.write(header.toByteArray(Charsets.ISO_8859_1))
+        out.write(bytes)
+        out.flush()
     }
 
     private fun send404(out: OutputStream) {
         val body = "<h1>404 Not Found</h1>".toByteArray()
-        val h = "HTTP/1.1 404 Not Found\r\nContent-Type: text/html\r\nContent-Length: ${body.size}\r\n\r\n"
-        out.write(h.toByteArray(Charsets.ISO_8859_1)); out.write(body); out.flush()
+        val header = "HTTP/1.1 404 Not Found\r\n" +
+            "Content-Type: text/html\r\n" +
+            "Content-Length: ${body.size}\r\n\r\n"
+        out.write(header.toByteArray(Charsets.ISO_8859_1))
+        out.write(body)
+        out.flush()
     }
 
-    private fun mime(name: String) = when (name.substringAfterLast('.', "").lowercase()) {
+    private fun getMime(name: String) = when (
+        name.substringAfterLast('.', "").lowercase()
+    ) {
         "html", "htm" -> "text/html; charset=utf-8"
         "css" -> "text/css; charset=utf-8"
         "js", "mjs" -> "application/javascript; charset=utf-8"
