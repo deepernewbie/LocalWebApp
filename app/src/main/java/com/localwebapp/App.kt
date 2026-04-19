@@ -194,6 +194,7 @@ class WebAppActivity : AppCompatActivity() {
     private lateinit var progressBar: ProgressBar
     private lateinit var errorView: View
     private lateinit var errorText: TextView
+    // server is now a property so the bridge can access its port
     private var server: SimpleServer? = null
     private var pendingPermissionRequest: PermissionRequest? = null
     private var filePathCallback: ValueCallback<Array<Uri>>? = null
@@ -247,11 +248,12 @@ class WebAppActivity : AppCompatActivity() {
         errorView = findViewById(R.id.errorView)
         errorText = findViewById(R.id.errorText)
 
-        setupWebView()
-
-        val s = SimpleServer(contentResolver, folderUri)
+        // Start server first so port is known before bridge is set up
+        val s = SimpleServer(contentResolver, folderUri, filesDir)
         server = s
         s.start()
+
+        setupWebView()
         webView.loadUrl("http://localhost:${s.port}/")
     }
 
@@ -273,6 +275,7 @@ class WebAppActivity : AppCompatActivity() {
 
         webView.addJavascriptInterface(object : Any() {
 
+            // ── Basic bridge ──────────────────────────────────────────
             @JavascriptInterface
             fun toast(msg: String) = runOnUiThread {
                 Toast.makeText(this@WebAppActivity, msg, Toast.LENGTH_SHORT).show()
@@ -314,11 +317,6 @@ class WebAppActivity : AppCompatActivity() {
                 } catch (e: Exception) { "error: ${e.message}" }
             }
 
-            /**
-             * Append a base64 chunk to a file.
-             * first=true creates/truncates, first=false appends.
-             * Called once per ~64KB chunk so RAM stays flat.
-             */
             @JavascriptInterface
             fun appendFile(path: String, base64Chunk: String, first: Boolean): String {
                 return try {
@@ -330,44 +328,18 @@ class WebAppActivity : AppCompatActivity() {
                 } catch (e: Exception) { "error: ${e.message}" }
             }
 
-            /**
-             * Read a file in chunks to avoid OOM on large files.
-             * offset = byte offset to start from.
-             * chunkSize = number of bytes to read (max ~1MB recommended).
-             * Returns base64 of the chunk, or "EOF" if past end, or "error:..."
-             */
-            @JavascriptInterface
-            fun readFileChunk(path: String, offset: Long, chunkSize: Int): String {
-                return try {
-                    val file = File(filesDir, sanitize(path))
-                    if (!file.exists()) return "error: not found"
-                    if (offset >= file.length()) return "EOF"
-                    val buf = ByteArray(chunkSize.coerceAtMost(
-                        (file.length() - offset).toInt().coerceAtMost(chunkSize)
-                    ))
-                    FileInputStream(file).use { fis ->
-                        fis.skip(offset)
-                        fis.read(buf)
-                    }
-                    Base64.encodeToString(buf, Base64.NO_WRAP)
-                } catch (e: Exception) { "error: ${e.message}" }
-            }
-
-            /**
-             * Get file size in bytes. Returns "0" if not found.
-             */
-            @JavascriptInterface
-            fun fileSize(path: String): String {
-                return try {
-                    File(filesDir, sanitize(path)).length().toString()
-                } catch (e: Exception) { "0" }
-            }
-
             @JavascriptInterface
             fun fileExists(path: String): String {
                 return try {
                     File(filesDir, sanitize(path)).exists().toString()
                 } catch (e: Exception) { "false" }
+            }
+
+            @JavascriptInterface
+            fun fileSize(path: String): String {
+                return try {
+                    File(filesDir, sanitize(path)).length().toString()
+                } catch (e: Exception) { "0" }
             }
 
             @JavascriptInterface
@@ -382,20 +354,21 @@ class WebAppActivity : AppCompatActivity() {
             }
 
             /**
-             * Legacy readFile — only safe for small files (config JSON etc).
-             * For large binary files use readFileChunk instead.
+             * readFile now returns an HTTP URL instead of base64.
+             * The SimpleServer streams the file from filesDir when
+             * this URL is fetched — zero RAM spike, any file size,
+             * fully transparent to the web app.
+             *
+             * The web app receives a URL string and can use it
+             * exactly like a blob:// URL in fetch(), new Blob(), etc.
              */
             @JavascriptInterface
             fun readFile(path: String): String {
-                return try {
-                    val file = File(filesDir, sanitize(path))
-                    if (!file.exists()) return "error: not found"
-                    // Safety limit — refuse to load files > 32MB in one call
-                    if (file.length() > 32 * 1024 * 1024) {
-                        return "error: file too large, use readFileChunk"
-                    }
-                    Base64.encodeToString(file.readBytes(), Base64.NO_WRAP)
-                } catch (e: Exception) { "error: ${e.message}" }
+                val clean = sanitize(path)
+                val file  = File(filesDir, clean)
+                if (!file.exists()) return "error: not found"
+                // Return a localhost URL — server streams it on demand
+                return "http://localhost:${server?.port}/~storage/$clean"
             }
 
             @JavascriptInterface
@@ -522,7 +495,7 @@ class WebAppActivity : AppCompatActivity() {
             override fun onGeolocationPermissionsShowPrompt(
                 origin: String, callback: GeolocationPermissions.Callback
             ) {
-                val fine = android.Manifest.permission.ACCESS_FINE_LOCATION
+                val fine   = android.Manifest.permission.ACCESS_FINE_LOCATION
                 val coarse = android.Manifest.permission.ACCESS_COARSE_LOCATION
                 if (checkSelfPermission(fine) ==
                     android.content.pm.PackageManager.PERMISSION_GRANTED) {
@@ -616,9 +589,15 @@ class WebAppActivity : AppCompatActivity() {
     override fun onResume() { super.onResume(); webView.onResume() }
 }
 
+/**
+ * Local HTTP server that serves:
+ * - /~storage/* → files from app's filesDir (for Android.readFile bridge)
+ * - everything else → files from the user's chosen web app folder
+ */
 class SimpleServer(
     private val resolver: ContentResolver,
-    private val rootUri: Uri
+    private val rootUri: Uri,
+    private val filesDir: File          // app private storage
 ) {
     private var serverSocket: ServerSocket? = null
     var port = 0
@@ -649,30 +628,71 @@ class SimpleServer(
 
     private fun handle(s: java.net.Socket) {
         val reader = s.inputStream.bufferedReader(Charsets.ISO_8859_1)
-        val out = s.outputStream
-        val line = reader.readLine() ?: return
-        val parts = line.trim().split(" ")
+        val out    = s.outputStream
+        val line   = reader.readLine() ?: return
+        val parts  = line.trim().split(" ")
         if (parts.size < 2) return
-        var path = URLDecoder.decode(parts[1].substringBefore("?"), "UTF-8")
+        var path   = URLDecoder.decode(parts[1].substringBefore("?"), "UTF-8")
+
+        // Consume headers
         do {
             val h = reader.readLine() ?: break
             if (h.isBlank()) break
         } while (true)
+
         if (path == "/" || path.isEmpty()) path = "/index.html"
+
+        // ── /~storage/* → stream from app filesDir ──────────────────
+        if (path.startsWith("/~storage/")) {
+            val filePath = path.removePrefix("/~storage/")
+                .replace("..", "").trimStart('/')
+            val file = File(filesDir, filePath)
+            if (!file.exists() || file.isDirectory) {
+                send404(out); return
+            }
+            streamFileFromDisk(out, file)
+            return
+        }
+
+        // ── everything else → serve from user's web app folder ───────
         val segments = path.trimStart('/').split("/")
             .filter { it.isNotEmpty() && it != ".." }
-        val file = resolve(segments)
+        val docFile = resolve(segments)
         when {
-            file == null || !file.exists() -> {
+            docFile == null || !docFile.exists() -> {
                 val idx = resolve(listOf("index.html"))
-                if (idx != null && idx.exists()) serveFile(out, idx) else send404(out)
+                if (idx != null && idx.exists()) serveDocFile(out, idx) else send404(out)
             }
-            file.isDirectory -> {
-                val idx = file.findFile("index.html")
-                if (idx != null) serveFile(out, idx) else send404(out)
+            docFile.isDirectory -> {
+                val idx = docFile.findFile("index.html")
+                if (idx != null) serveDocFile(out, idx) else send404(out)
             }
-            else -> serveFile(out, file)
+            else -> serveDocFile(out, docFile)
         }
+    }
+
+    /**
+     * Stream a file from app filesDir directly to the socket.
+     * Uses a fixed 256KB buffer — constant RAM regardless of file size.
+     */
+    private fun streamFileFromDisk(out: OutputStream, file: File) {
+        val mime = getMime(file.name)
+        val header = "HTTP/1.1 200 OK\r\n" +
+            "Content-Type: $mime\r\n" +
+            "Content-Length: ${file.length()}\r\n" +
+            "Access-Control-Allow-Origin: *\r\n" +
+            "Cache-Control: no-cache\r\n\r\n"
+        out.write(header.toByteArray(Charsets.ISO_8859_1))
+
+        // Stream in 256KB chunks — never loads full file into RAM
+        val buf = ByteArray(256 * 1024)
+        FileInputStream(file).use { fis ->
+            var n: Int
+            while (fis.read(buf).also { n = it } != -1) {
+                out.write(buf, 0, n)
+            }
+        }
+        out.flush()
     }
 
     private fun resolve(segments: List<String>): DocumentFile? {
@@ -686,19 +706,19 @@ class SimpleServer(
         return node
     }
 
-    private fun serveFile(out: OutputStream, file: DocumentFile) {
+    private fun serveDocFile(out: OutputStream, file: DocumentFile) {
         val bytes = resolver.openInputStream(file.uri)?.use { it.readBytes() }
             ?: run { send404(out); return }
-        val mime = getMime(file.name ?: "")
+        val mime   = getMime(file.name ?: "")
         val header = "HTTP/1.1 200 OK\r\nContent-Type: $mime\r\n" +
-            "Content-Length: ${bytes.size}\r\nAccess-Control-Allow-Origin: *\r\n" +
-            "Cache-Control: no-cache\r\n\r\n"
+            "Content-Length: ${bytes.size}\r\n" +
+            "Access-Control-Allow-Origin: *\r\nCache-Control: no-cache\r\n\r\n"
         out.write(header.toByteArray(Charsets.ISO_8859_1))
         out.write(bytes); out.flush()
     }
 
     private fun send404(out: OutputStream) {
-        val body = "<h1>404 Not Found</h1>".toByteArray()
+        val body   = "<h1>404 Not Found</h1>".toByteArray()
         val header = "HTTP/1.1 404 Not Found\r\nContent-Type: text/html\r\n" +
             "Content-Length: ${body.size}\r\n\r\n"
         out.write(header.toByteArray(Charsets.ISO_8859_1))
