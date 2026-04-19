@@ -191,6 +191,17 @@ class WebAppActivity : AppCompatActivity() {
     private lateinit var errorView: View
     private lateinit var errorText: TextView
     private var server: SimpleServer? = null
+    private var permissionRequest: PermissionRequest? = null
+
+    private val cameraPermissionLauncher =
+        registerForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
+            if (granted) {
+                permissionRequest?.grant(permissionRequest!!.resources)
+            } else {
+                permissionRequest?.deny()
+            }
+            permissionRequest = null
+        }
 
     @SuppressLint("SetJavaScriptEnabled")
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -262,14 +273,18 @@ class WebAppActivity : AppCompatActivity() {
             override fun onPageFinished(v: WebView, url: String) {
                 progressBar.visibility = View.GONE
             }
-            override fun onReceivedError(v: WebView, req: WebResourceRequest, err: WebResourceError) {
+            override fun onReceivedError(
+                v: WebView, req: WebResourceRequest, err: WebResourceError
+            ) {
                 if (req.isForMainFrame) {
                     progressBar.visibility = View.GONE
                     errorView.visibility = View.VISIBLE
                     errorText.text = "Error: ${err.description}"
                 }
             }
-            override fun shouldOverrideUrlLoading(v: WebView, req: WebResourceRequest): Boolean {
+            override fun shouldOverrideUrlLoading(
+                v: WebView, req: WebResourceRequest
+            ): Boolean {
                 val url = req.url.toString()
                 if (url.startsWith("http://localhost")) return false
                 startActivity(Intent(Intent.ACTION_VIEW, req.url))
@@ -287,6 +302,41 @@ class WebAppActivity : AppCompatActivity() {
             }
             override fun onConsoleMessage(m: ConsoleMessage): Boolean {
                 android.util.Log.d("WebApp-JS", m.message())
+                return true
+            }
+            override fun onPermissionRequest(request: PermissionRequest) {
+                val needsCamera = request.resources.contains(PermissionRequest.RESOURCE_VIDEO_CAPTURE)
+                if (needsCamera) {
+                    if (checkSelfPermission(android.Manifest.permission.CAMERA) ==
+                        android.content.pm.PackageManager.PERMISSION_GRANTED
+                    ) {
+                        request.grant(request.resources)
+                    } else {
+                        permissionRequest = request
+                        cameraPermissionLauncher.launch(android.Manifest.permission.CAMERA)
+                    }
+                } else {
+                    request.grant(request.resources)
+                }
+            }
+            override fun onJsAlert(
+                view: WebView, url: String, message: String, result: JsResult
+            ): Boolean {
+                AlertDialog.Builder(this@WebAppActivity)
+                    .setMessage(message)
+                    .setPositiveButton("OK") { _, _ -> result.confirm() }
+                    .setOnCancelListener { result.cancel() }
+                    .show()
+                return true
+            }
+            override fun onJsConfirm(
+                view: WebView, url: String, message: String, result: JsResult
+            ): Boolean {
+                AlertDialog.Builder(this@WebAppActivity)
+                    .setMessage(message)
+                    .setPositiveButton("OK") { _, _ -> result.confirm() }
+                    .setNegativeButton("Cancel") { _, _ -> result.cancel() }
+                    .show()
                 return true
             }
         }
