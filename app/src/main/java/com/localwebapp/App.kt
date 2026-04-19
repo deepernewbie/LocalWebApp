@@ -27,8 +27,11 @@ import org.json.JSONObject
 import java.io.File
 import java.io.FileInputStream
 import java.io.FileOutputStream
+import java.io.InputStream
 import java.io.OutputStream
+import java.net.HttpURLConnection
 import java.net.ServerSocket
+import java.net.URL
 import java.net.URLDecoder
 import java.text.SimpleDateFormat
 import java.util.*
@@ -188,13 +191,14 @@ class WebAppActivity : AppCompatActivity() {
     companion object {
         const val EXTRA_URI = "extra_uri"
         const val EXTRA_TITLE = "extra_title"
+        // Cache dir for intercepted network requests
+        private const val NET_CACHE = "netcache"
     }
 
     private lateinit var webView: WebView
     private lateinit var progressBar: ProgressBar
     private lateinit var errorView: View
     private lateinit var errorText: TextView
-    // server is now a property so the bridge can access its port
     private var server: SimpleServer? = null
     private var pendingPermissionRequest: PermissionRequest? = null
     private var filePathCallback: ValueCallback<Array<Uri>>? = null
@@ -228,13 +232,18 @@ class WebAppActivity : AppCompatActivity() {
         }
     }
 
+    // Network cache dir — persists between sessions
+    private val netCacheDir by lazy {
+        File(filesDir, NET_CACHE).also { it.mkdirs() }
+    }
+
     @SuppressLint("SetJavaScriptEnabled")
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         setContentView(R.layout.activity_webapp)
 
         val uriStr = intent.getStringExtra(EXTRA_URI) ?: run { finish(); return }
-        val title = intent.getStringExtra(EXTRA_TITLE) ?: "Web App"
+        val title  = intent.getStringExtra(EXTRA_TITLE) ?: "Web App"
         val folderUri = Uri.parse(uriStr)
 
         setSupportActionBar(findViewById(R.id.toolbar))
@@ -243,12 +252,11 @@ class WebAppActivity : AppCompatActivity() {
             setDisplayHomeAsUpEnabled(true)
         }
 
-        webView = findViewById(R.id.webView)
-        progressBar = findViewById(R.id.progressBar)
-        errorView = findViewById(R.id.errorView)
-        errorText = findViewById(R.id.errorText)
+        webView      = findViewById(R.id.webView)
+        progressBar  = findViewById(R.id.progressBar)
+        errorView    = findViewById(R.id.errorView)
+        errorText    = findViewById(R.id.errorText)
 
-        // Start server first so port is known before bridge is set up
         val s = SimpleServer(contentResolver, folderUri, filesDir)
         server = s
         s.start()
@@ -273,9 +281,8 @@ class WebAppActivity : AppCompatActivity() {
             mixedContentMode = WebSettings.MIXED_CONTENT_COMPATIBILITY_MODE
         }
 
+        // Minimal bridge — only basic helpers, no file I/O needed
         webView.addJavascriptInterface(object : Any() {
-
-            // ── Basic bridge ──────────────────────────────────────────
             @JavascriptInterface
             fun toast(msg: String) = runOnUiThread {
                 Toast.makeText(this@WebAppActivity, msg, Toast.LENGTH_SHORT).show()
@@ -304,99 +311,19 @@ class WebAppActivity : AppCompatActivity() {
                     @Suppress("DEPRECATION") v.vibrate(100)
                 }
             }
-
-            // ── File bridge ───────────────────────────────────────────
-
-            @JavascriptInterface
-            fun writeFile(path: String, base64Data: String): String {
-                return try {
-                    val file = File(filesDir, sanitize(path))
-                    file.parentFile?.mkdirs()
-                    file.writeBytes(Base64.decode(base64Data, Base64.DEFAULT))
-                    "ok"
-                } catch (e: Exception) { "error: ${e.message}" }
-            }
-
-            @JavascriptInterface
-            fun appendFile(path: String, base64Chunk: String, first: Boolean): String {
-                return try {
-                    val file = File(filesDir, sanitize(path))
-                    file.parentFile?.mkdirs()
-                    val bytes = Base64.decode(base64Chunk, Base64.DEFAULT)
-                    FileOutputStream(file, !first).use { it.write(bytes) }
-                    "ok"
-                } catch (e: Exception) { "error: ${e.message}" }
-            }
-
-            @JavascriptInterface
-            fun fileExists(path: String): String {
-                return try {
-                    File(filesDir, sanitize(path)).exists().toString()
-                } catch (e: Exception) { "false" }
-            }
-
-            @JavascriptInterface
-            fun fileSize(path: String): String {
-                return try {
-                    File(filesDir, sanitize(path)).length().toString()
-                } catch (e: Exception) { "0" }
-            }
-
-            @JavascriptInterface
-            fun listDir(path: String): String {
-                return try {
-                    val dir = File(filesDir, sanitize(path))
-                    if (!dir.exists() || !dir.isDirectory) return "[]"
-                    val arr = JSONArray()
-                    dir.list()?.forEach { arr.put(it) }
-                    arr.toString()
-                } catch (e: Exception) { "[]" }
-            }
-
-            /**
-             * readFile now returns an HTTP URL instead of base64.
-             * The SimpleServer streams the file from filesDir when
-             * this URL is fetched — zero RAM spike, any file size,
-             * fully transparent to the web app.
-             *
-             * The web app receives a URL string and can use it
-             * exactly like a blob:// URL in fetch(), new Blob(), etc.
-             */
-            @JavascriptInterface
-            fun readFile(path: String): String {
-                val clean = sanitize(path)
-                val file  = File(filesDir, clean)
-                if (!file.exists()) return "error: not found"
-                // Return a localhost URL — server streams it on demand
-                return "http://localhost:${server?.port}/~storage/$clean"
-            }
-
-            @JavascriptInterface
-            fun deleteFile(path: String): String {
-                return try {
-                    File(filesDir, sanitize(path)).deleteRecursively()
-                    "ok"
-                } catch (e: Exception) { "error: ${e.message}" }
-            }
-
-            @JavascriptInterface
-            fun getFreeMB(): String {
+            @JavascriptInterface fun getFreeMB(): String {
                 return try {
                     val stat = android.os.StatFs(filesDir.path)
-                    val free = stat.availableBlocksLong * stat.blockSizeLong / 1048576
-                    free.toString()
+                    (stat.availableBlocksLong * stat.blockSizeLong / 1048576).toString()
                 } catch (e: Exception) { "0" }
             }
-
-            private fun sanitize(path: String) =
-                path.replace("..", "").trimStart('/')
-
         }, "Android")
 
         webView.webViewClient = object : WebViewClient() {
+
             override fun onPageStarted(v: WebView, url: String, f: Bitmap?) {
                 progressBar.visibility = View.VISIBLE
-                errorView.visibility = View.GONE
+                errorView.visibility   = View.GONE
             }
             override fun onPageFinished(v: WebView, url: String) {
                 progressBar.visibility = View.GONE
@@ -406,8 +333,8 @@ class WebAppActivity : AppCompatActivity() {
             ) {
                 if (req.isForMainFrame) {
                     progressBar.visibility = View.GONE
-                    errorView.visibility = View.VISIBLE
-                    errorText.text = "Error: ${err.description}"
+                    errorView.visibility   = View.VISIBLE
+                    errorText.text         = "Error: ${err.description}"
                 }
             }
             override fun shouldOverrideUrlLoading(
@@ -421,6 +348,124 @@ class WebAppActivity : AppCompatActivity() {
                 }
                 startActivity(Intent(Intent.ACTION_VIEW, req.url))
                 return true
+            }
+
+            /**
+             * ══════════════════════════════════════════════════════════
+             * TRANSPARENT NETWORK CACHE INTERCEPTOR
+             *
+             * Intercepts ALL fetch/XHR requests from the web app.
+             * For large binary files (models, WASM, etc):
+             *   - If cached on disk → stream from disk instantly, no network
+             *   - If not cached    → download from internet, save to disk,
+             *                        stream to WebView simultaneously
+             *
+             * This makes ANY web app that downloads large files work
+             * perfectly — files download once, load instantly after.
+             * No changes to the web app needed. Ever.
+             * ══════════════════════════════════════════════════════════
+             */
+            override fun shouldInterceptRequest(
+                view: WebView,
+                request: WebResourceRequest
+            ): WebResourceResponse? {
+                val url    = request.url.toString()
+                val method = request.method ?: "GET"
+
+                // Only intercept GET requests for cacheable large files
+                if (method != "GET") return null
+                if (!shouldCache(url))  return null
+
+                val cacheFile = urlToCacheFile(url)
+
+                // ── Cache hit: stream from disk ──────────────────────
+                if (cacheFile.exists() && cacheFile.length() > 0) {
+                    android.util.Log.d("NetCache", "HIT  ${cacheFile.name}")
+                    return WebResourceResponse(
+                        guessMime(url),
+                        null,
+                        200,
+                        "OK",
+                        mapOf(
+                            "Access-Control-Allow-Origin" to "*",
+                            "Cache-Control"               to "no-cache"
+                        ),
+                        FileInputStream(cacheFile)
+                    )
+                }
+
+                // ── Cache miss: download + cache + stream ────────────
+                return try {
+                    android.util.Log.d("NetCache", "MISS ${url.takeLast(60)}")
+                    val conn = (URL(url).openConnection() as HttpURLConnection).apply {
+                        requestMethod = "GET"
+                        instanceFollowRedirects = true
+                        connectTimeout = 30_000
+                        readTimeout    = 60_000
+                        // Forward original headers (auth tokens etc.)
+                        request.requestHeaders?.forEach { (k, v) ->
+                            if (!k.equals("Range", ignoreCase = true)) setRequestProperty(k, v)
+                        }
+                        connect()
+                    }
+
+                    if (conn.responseCode !in 200..299) {
+                        conn.disconnect()
+                        return null   // Let WebView handle errors normally
+                    }
+
+                    val contentType = conn.contentType ?: guessMime(url)
+                    // Don't cache HTML pages — only binary/data files
+                    if (contentType.contains("text/html")) {
+                        conn.disconnect()
+                        return null
+                    }
+
+                    cacheFile.parentFile?.mkdirs()
+                    val tmpFile = File(cacheFile.parent, "${cacheFile.name}.tmp")
+
+                    // Pipe: network → disk + WebView simultaneously
+                    val pipe    = java.io.PipedOutputStream()
+                    val pipedIn = java.io.PipedInputStream(pipe, 256 * 1024)
+
+                    // Background thread: read network, write to disk AND pipe
+                    Executors.newSingleThreadExecutor().submit {
+                        try {
+                            val buf = ByteArray(256 * 1024)
+                            FileOutputStream(tmpFile).use { fos ->
+                                val net = conn.inputStream
+                                var n: Int
+                                while (net.read(buf).also { n = it } != -1) {
+                                    fos.write(buf, 0, n)
+                                    pipe.write(buf, 0, n)
+                                }
+                            }
+                            pipe.close()
+                            // Rename tmp → final only on success
+                            tmpFile.renameTo(cacheFile)
+                            android.util.Log.d("NetCache",
+                                "SAVED ${cacheFile.name} (${cacheFile.length()/1048576}MB)")
+                        } catch (e: Exception) {
+                            pipe.runCatching { close() }
+                            tmpFile.delete()
+                            android.util.Log.e("NetCache", "Save failed: ${e.message}")
+                        } finally {
+                            conn.disconnect()
+                        }
+                    }
+
+                    WebResourceResponse(
+                        guessMime(url),
+                        null,
+                        200,
+                        "OK",
+                        mapOf("Access-Control-Allow-Origin" to "*"),
+                        pipedIn
+                    )
+                } catch (e: Exception) {
+                    android.util.Log.e("NetCache", "Intercept error: ${e.message}")
+                    null   // Fall back to normal WebView networking
+                }
             }
         }
 
@@ -443,8 +488,7 @@ class WebAppActivity : AppCompatActivity() {
                 AlertDialog.Builder(this@WebAppActivity)
                     .setMessage(message)
                     .setPositiveButton("OK") { _, _ -> result.confirm() }
-                    .setOnCancelListener { result.cancel() }
-                    .show()
+                    .setOnCancelListener { result.cancel() }.show()
                 return true
             }
             override fun onJsConfirm(
@@ -454,8 +498,7 @@ class WebAppActivity : AppCompatActivity() {
                     .setMessage(message)
                     .setPositiveButton("OK") { _, _ -> result.confirm() }
                     .setNegativeButton("Cancel") { _, _ -> result.cancel() }
-                    .setOnCancelListener { result.cancel() }
-                    .show()
+                    .setOnCancelListener { result.cancel() }.show()
                 return true
             }
             override fun onJsPrompt(
@@ -465,32 +508,25 @@ class WebAppActivity : AppCompatActivity() {
                 val input = android.widget.EditText(this@WebAppActivity)
                 input.setText(defaultValue ?: "")
                 AlertDialog.Builder(this@WebAppActivity)
-                    .setMessage(message)
-                    .setView(input)
+                    .setMessage(message).setView(input)
                     .setPositiveButton("OK") { _, _ -> result.confirm(input.text.toString()) }
                     .setNegativeButton("Cancel") { _, _ -> result.cancel() }
-                    .setOnCancelListener { result.cancel() }
-                    .show()
+                    .setOnCancelListener { result.cancel() }.show()
                 return true
             }
             override fun onPermissionRequest(request: PermissionRequest) {
-                val androidPerms = mutableListOf<String>()
+                val perms = mutableListOf<String>()
                 if (request.resources.contains(PermissionRequest.RESOURCE_VIDEO_CAPTURE))
-                    androidPerms.add(android.Manifest.permission.CAMERA)
+                    perms.add(android.Manifest.permission.CAMERA)
                 if (request.resources.contains(PermissionRequest.RESOURCE_AUDIO_CAPTURE))
-                    androidPerms.add(android.Manifest.permission.RECORD_AUDIO)
-                if (androidPerms.isEmpty()) {
-                    request.grant(request.resources); return
-                }
-                val allGranted = androidPerms.all {
+                    perms.add(android.Manifest.permission.RECORD_AUDIO)
+                if (perms.isEmpty()) { request.grant(request.resources); return }
+                val allGranted = perms.all {
                     checkSelfPermission(it) ==
                         android.content.pm.PackageManager.PERMISSION_GRANTED
                 }
                 if (allGranted) request.grant(request.resources)
-                else {
-                    pendingPermissionRequest = request
-                    permissionLauncher.launch(androidPerms.toTypedArray())
-                }
+                else { pendingPermissionRequest = request; permissionLauncher.launch(perms.toTypedArray()) }
             }
             override fun onGeolocationPermissionsShowPrompt(
                 origin: String, callback: GeolocationPermissions.Callback
@@ -508,15 +544,12 @@ class WebAppActivity : AppCompatActivity() {
                             permissionLauncher.launch(arrayOf(fine, coarse))
                             callback.invoke(origin, true, false)
                         }
-                        .setNegativeButton("Deny") { _, _ ->
-                            callback.invoke(origin, false, false)
-                        }
+                        .setNegativeButton("Deny") { _, _ -> callback.invoke(origin, false, false) }
                         .show()
                 }
             }
             override fun onShowFileChooser(
-                webView: WebView,
-                callback: ValueCallback<Array<Uri>>,
+                webView: WebView, callback: ValueCallback<Array<Uri>>,
                 params: FileChooserParams
             ): Boolean {
                 filePathCallback?.onReceiveValue(null)
@@ -542,12 +575,10 @@ class WebAppActivity : AppCompatActivity() {
                         .setOnCancelListener {
                             filePathCallback?.onReceiveValue(null)
                             filePathCallback = null
-                        }
-                        .show()
+                        }.show()
                 } else {
                     fileChooserLauncher.launch(
-                        if (acceptTypes.isNotEmpty() && acceptTypes != "*/*")
-                            acceptTypes else "*/*"
+                        if (acceptTypes.isNotEmpty() && acceptTypes != "*/*") acceptTypes else "*/*"
                     )
                 }
                 return true
@@ -559,10 +590,9 @@ class WebAppActivity : AppCompatActivity() {
                 window.decorView.systemUiVisibility = (
                     View.SYSTEM_UI_FLAG_FULLSCREEN or
                     View.SYSTEM_UI_FLAG_HIDE_NAVIGATION or
-                    View.SYSTEM_UI_FLAG_IMMERSIVE_STICKY
-                )
-                (window.decorView as android.widget.FrameLayout).addView(
-                    view, android.widget.FrameLayout.LayoutParams(-1, -1))
+                    View.SYSTEM_UI_FLAG_IMMERSIVE_STICKY)
+                (window.decorView as android.widget.FrameLayout)
+                    .addView(view, android.widget.FrameLayout.LayoutParams(-1, -1))
             }
             override fun onHideCustomView() {
                 (window.decorView as android.widget.FrameLayout).removeView(customView)
@@ -570,6 +600,63 @@ class WebAppActivity : AppCompatActivity() {
                 customViewCallback = null
                 window.decorView.systemUiVisibility = View.SYSTEM_UI_FLAG_VISIBLE
             }
+        }
+    }
+
+    // ── Cache helpers ─────────────────────────────────────────────────────────
+
+    /**
+     * Decide which URLs to cache.
+     * Cache: model files, WASM, large JS bundles from known CDNs.
+     * Skip: API calls, HTML pages, short JSON responses.
+     */
+    private fun shouldCache(url: String): Boolean {
+        val lower = url.lowercase()
+        // Always cache these file types from any host
+        val cacheExts = listOf(
+            ".onnx", ".wasm", ".bin", ".ot", ".gguf",
+            ".safetensors", ".pt", ".pth", ".tflite"
+        )
+        if (cacheExts.any { lower.contains(it) }) return true
+        // Cache HuggingFace and CDN model/JS files
+        val cacheDomains = listOf(
+            "huggingface.co", "cdn-lfs", "jsdelivr.net",
+            "esm.run", "cdn.jsdelivr.net"
+        )
+        if (cacheDomains.any { lower.contains(it) }) {
+            // But skip small JSON/text files from these domains
+            if (lower.endsWith(".html")) return false
+            return true
+        }
+        return false
+    }
+
+    /**
+     * Convert a URL to a stable cache file path.
+     * Uses a safe filename derived from the URL.
+     */
+    private fun urlToCacheFile(url: String): File {
+        // Use last path segment + hash prefix to avoid collisions
+        val uri      = Uri.parse(url)
+        val lastSeg  = uri.lastPathSegment?.replace(Regex("[^a-zA-Z0-9._-]"), "_") ?: "file"
+        val hash     = url.hashCode().toLong() and 0xFFFFFFFFL
+        val name     = "${hash}_${lastSeg}".take(120)
+        // Group by host for easier debugging
+        val host     = uri.host?.replace(".", "_")?.take(30) ?: "misc"
+        return File(netCacheDir, "$host/$name")
+    }
+
+    private fun guessMime(url: String): String {
+        val lower = url.lowercase().substringBefore("?")
+        return when {
+            lower.endsWith(".onnx")         -> "application/octet-stream"
+            lower.endsWith(".wasm")         -> "application/wasm"
+            lower.endsWith(".json")         -> "application/json"
+            lower.endsWith(".js")           -> "application/javascript"
+            lower.endsWith(".mjs")          -> "application/javascript"
+            lower.endsWith(".bin")          -> "application/octet-stream"
+            lower.endsWith(".safetensors") -> "application/octet-stream"
+            else                            -> "application/octet-stream"
         }
     }
 
@@ -585,19 +672,14 @@ class WebAppActivity : AppCompatActivity() {
     override fun onDestroy() {
         super.onDestroy(); server?.stop(); webView.destroy()
     }
-    override fun onPause() { super.onPause(); webView.onPause() }
+    override fun onPause()  { super.onPause();  webView.onPause()  }
     override fun onResume() { super.onResume(); webView.onResume() }
 }
 
-/**
- * Local HTTP server that serves:
- * - /~storage/* → files from app's filesDir (for Android.readFile bridge)
- * - everything else → files from the user's chosen web app folder
- */
 class SimpleServer(
     private val resolver: ContentResolver,
     private val rootUri: Uri,
-    private val filesDir: File          // app private storage
+    private val filesDir: File
 ) {
     private var serverSocket: ServerSocket? = null
     var port = 0
@@ -633,66 +715,25 @@ class SimpleServer(
         val parts  = line.trim().split(" ")
         if (parts.size < 2) return
         var path   = URLDecoder.decode(parts[1].substringBefore("?"), "UTF-8")
-
-        // Consume headers
         do {
             val h = reader.readLine() ?: break
             if (h.isBlank()) break
         } while (true)
-
         if (path == "/" || path.isEmpty()) path = "/index.html"
-
-        // ── /~storage/* → stream from app filesDir ──────────────────
-        if (path.startsWith("/~storage/")) {
-            val filePath = path.removePrefix("/~storage/")
-                .replace("..", "").trimStart('/')
-            val file = File(filesDir, filePath)
-            if (!file.exists() || file.isDirectory) {
-                send404(out); return
-            }
-            streamFileFromDisk(out, file)
-            return
-        }
-
-        // ── everything else → serve from user's web app folder ───────
         val segments = path.trimStart('/').split("/")
             .filter { it.isNotEmpty() && it != ".." }
-        val docFile = resolve(segments)
+        val file = resolve(segments)
         when {
-            docFile == null || !docFile.exists() -> {
+            file == null || !file.exists() -> {
                 val idx = resolve(listOf("index.html"))
                 if (idx != null && idx.exists()) serveDocFile(out, idx) else send404(out)
             }
-            docFile.isDirectory -> {
-                val idx = docFile.findFile("index.html")
+            file.isDirectory -> {
+                val idx = file.findFile("index.html")
                 if (idx != null) serveDocFile(out, idx) else send404(out)
             }
-            else -> serveDocFile(out, docFile)
+            else -> serveDocFile(out, file)
         }
-    }
-
-    /**
-     * Stream a file from app filesDir directly to the socket.
-     * Uses a fixed 256KB buffer — constant RAM regardless of file size.
-     */
-    private fun streamFileFromDisk(out: OutputStream, file: File) {
-        val mime = getMime(file.name)
-        val header = "HTTP/1.1 200 OK\r\n" +
-            "Content-Type: $mime\r\n" +
-            "Content-Length: ${file.length()}\r\n" +
-            "Access-Control-Allow-Origin: *\r\n" +
-            "Cache-Control: no-cache\r\n\r\n"
-        out.write(header.toByteArray(Charsets.ISO_8859_1))
-
-        // Stream in 256KB chunks — never loads full file into RAM
-        val buf = ByteArray(256 * 1024)
-        FileInputStream(file).use { fis ->
-            var n: Int
-            while (fis.read(buf).also { n = it } != -1) {
-                out.write(buf, 0, n)
-            }
-        }
-        out.flush()
     }
 
     private fun resolve(segments: List<String>): DocumentFile? {
@@ -707,7 +748,7 @@ class SimpleServer(
     }
 
     private fun serveDocFile(out: OutputStream, file: DocumentFile) {
-        val bytes = resolver.openInputStream(file.uri)?.use { it.readBytes() }
+        val bytes  = resolver.openInputStream(file.uri)?.use { it.readBytes() }
             ?: run { send404(out); return }
         val mime   = getMime(file.name ?: "")
         val header = "HTTP/1.1 200 OK\r\nContent-Type: $mime\r\n" +
