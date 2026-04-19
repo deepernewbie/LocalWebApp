@@ -191,7 +191,6 @@ class WebAppActivity : AppCompatActivity() {
     companion object {
         const val EXTRA_URI = "extra_uri"
         const val EXTRA_TITLE = "extra_title"
-        // Cache dir for intercepted network requests
         private const val NET_CACHE = "netcache"
     }
 
@@ -232,7 +231,6 @@ class WebAppActivity : AppCompatActivity() {
         }
     }
 
-    // Network cache dir — persists between sessions
     private val netCacheDir by lazy {
         File(filesDir, NET_CACHE).also { it.mkdirs() }
     }
@@ -252,10 +250,10 @@ class WebAppActivity : AppCompatActivity() {
             setDisplayHomeAsUpEnabled(true)
         }
 
-        webView      = findViewById(R.id.webView)
-        progressBar  = findViewById(R.id.progressBar)
-        errorView    = findViewById(R.id.errorView)
-        errorText    = findViewById(R.id.errorText)
+        webView     = findViewById(R.id.webView)
+        progressBar = findViewById(R.id.progressBar)
+        errorView   = findViewById(R.id.errorView)
+        errorText   = findViewById(R.id.errorText)
 
         val s = SimpleServer(contentResolver, folderUri, filesDir)
         server = s
@@ -281,7 +279,6 @@ class WebAppActivity : AppCompatActivity() {
             mixedContentMode = WebSettings.MIXED_CONTENT_COMPATIBILITY_MODE
         }
 
-        // Minimal bridge — only basic helpers, no file I/O needed
         webView.addJavascriptInterface(object : Any() {
             @JavascriptInterface
             fun toast(msg: String) = runOnUiThread {
@@ -351,19 +348,15 @@ class WebAppActivity : AppCompatActivity() {
             }
 
             /**
-             * ══════════════════════════════════════════════════════════
-             * TRANSPARENT NETWORK CACHE INTERCEPTOR
+             * Transparent caching proxy.
              *
-             * Intercepts ALL fetch/XHR requests from the web app.
-             * For large binary files (models, WASM, etc):
-             *   - If cached on disk → stream from disk instantly, no network
-             *   - If not cached    → download from internet, save to disk,
-             *                        stream to WebView simultaneously
+             * Strategy for large files (models, WASM etc):
+             *   - Download fully to disk first in a background thread
+             *   - Only THEN stream to WebView from disk
+             *   - This avoids the PipedStream overflow that caused
+             *     "Failed to fetch" on large files
              *
-             * This makes ANY web app that downloads large files work
-             * perfectly — files download once, load instantly after.
-             * No changes to the web app needed. Ever.
-             * ══════════════════════════════════════════════════════════
+             * For cached files: stream directly from disk instantly.
              */
             override fun shouldInterceptRequest(
                 view: WebView,
@@ -371,51 +364,30 @@ class WebAppActivity : AppCompatActivity() {
             ): WebResourceResponse? {
                 val url    = request.url.toString()
                 val method = request.method ?: "GET"
-
-                // Only intercept GET requests for cacheable large files
-                if (method != "GET") return null
-                if (!shouldCache(url))  return null
+                if (method != "GET")     return null
+                if (!shouldCache(url))   return null
 
                 val cacheFile = urlToCacheFile(url)
 
-                // ── Cache hit: stream from disk ──────────────────────
+                // ── Cache hit: stream from disk immediately ───────────
                 if (cacheFile.exists() && cacheFile.length() > 0) {
                     android.util.Log.d("NetCache", "HIT  ${cacheFile.name}")
-                    return WebResourceResponse(
-                        guessMime(url),
-                        null,
-                        200,
-                        "OK",
-                        mapOf(
-                            "Access-Control-Allow-Origin" to "*",
-                            "Cache-Control"               to "no-cache"
-                        ),
-                        FileInputStream(cacheFile)
-                    )
+                    return streamFromDisk(cacheFile, url)
                 }
 
-                // ── Cache miss: download + cache + stream ────────────
+                // ── Cache miss: download fully to disk, then serve ────
                 return try {
                     android.util.Log.d("NetCache", "MISS ${url.takeLast(60)}")
-                    val conn = (URL(url).openConnection() as HttpURLConnection).apply {
-                        requestMethod = "GET"
-                        instanceFollowRedirects = true
-                        connectTimeout = 30_000
-                        readTimeout    = 60_000
-                        // Forward original headers (auth tokens etc.)
-                        request.requestHeaders?.forEach { (k, v) ->
-                            if (!k.equals("Range", ignoreCase = true)) setRequestProperty(k, v)
-                        }
-                        connect()
-                    }
 
-                    if (conn.responseCode !in 200..299) {
+                    val conn = openConnection(url, request)
+                    val code = conn.responseCode
+
+                    if (code !in 200..299) {
                         conn.disconnect()
-                        return null   // Let WebView handle errors normally
+                        return null
                     }
 
                     val contentType = conn.contentType ?: guessMime(url)
-                    // Don't cache HTML pages — only binary/data files
                     if (contentType.contains("text/html")) {
                         conn.disconnect()
                         return null
@@ -423,48 +395,38 @@ class WebAppActivity : AppCompatActivity() {
 
                     cacheFile.parentFile?.mkdirs()
                     val tmpFile = File(cacheFile.parent, "${cacheFile.name}.tmp")
+                    tmpFile.delete()
 
-                    // Pipe: network → disk + WebView simultaneously
-                    val pipe    = java.io.PipedOutputStream()
-                    val pipedIn = java.io.PipedInputStream(pipe, 256 * 1024)
-
-                    // Background thread: read network, write to disk AND pipe
-                    Executors.newSingleThreadExecutor().submit {
-                        try {
-                            val buf = ByteArray(256 * 1024)
-                            FileOutputStream(tmpFile).use { fos ->
-                                val net = conn.inputStream
-                                var n: Int
-                                while (net.read(buf).also { n = it } != -1) {
-                                    fos.write(buf, 0, n)
-                                    pipe.write(buf, 0, n)
-                                }
+                    // Download completely to disk first — no pipe needed
+                    val buf = ByteArray(512 * 1024) // 512KB buffer
+                    try {
+                        FileOutputStream(tmpFile).use { fos ->
+                            val net = conn.inputStream
+                            var n: Int
+                            while (net.read(buf).also { n = it } != -1) {
+                                fos.write(buf, 0, n)
                             }
-                            pipe.close()
-                            // Rename tmp → final only on success
-                            tmpFile.renameTo(cacheFile)
-                            android.util.Log.d("NetCache",
-                                "SAVED ${cacheFile.name} (${cacheFile.length()/1048576}MB)")
-                        } catch (e: Exception) {
-                            pipe.runCatching { close() }
-                            tmpFile.delete()
-                            android.util.Log.e("NetCache", "Save failed: ${e.message}")
-                        } finally {
-                            conn.disconnect()
                         }
+                        tmpFile.renameTo(cacheFile)
+                        android.util.Log.d("NetCache",
+                            "SAVED ${cacheFile.name} (${cacheFile.length()/1048576}MB)")
+                    } catch (e: Exception) {
+                        tmpFile.delete()
+                        android.util.Log.e("NetCache", "Download failed: ${e.message}")
+                        conn.disconnect()
+                        return null
+                    } finally {
+                        conn.disconnect()
                     }
 
-                    WebResourceResponse(
-                        guessMime(url),
-                        null,
-                        200,
-                        "OK",
-                        mapOf("Access-Control-Allow-Origin" to "*"),
-                        pipedIn
-                    )
+                    // Now serve from disk — file is fully written
+                    if (cacheFile.exists() && cacheFile.length() > 0) {
+                        streamFromDisk(cacheFile, url)
+                    } else null
+
                 } catch (e: Exception) {
                     android.util.Log.e("NetCache", "Intercept error: ${e.message}")
-                    null   // Fall back to normal WebView networking
+                    null
                 }
             }
         }
@@ -526,7 +488,10 @@ class WebAppActivity : AppCompatActivity() {
                         android.content.pm.PackageManager.PERMISSION_GRANTED
                 }
                 if (allGranted) request.grant(request.resources)
-                else { pendingPermissionRequest = request; permissionLauncher.launch(perms.toTypedArray()) }
+                else {
+                    pendingPermissionRequest = request
+                    permissionLauncher.launch(perms.toTypedArray())
+                }
             }
             override fun onGeolocationPermissionsShowPrompt(
                 origin: String, callback: GeolocationPermissions.Callback
@@ -544,8 +509,9 @@ class WebAppActivity : AppCompatActivity() {
                             permissionLauncher.launch(arrayOf(fine, coarse))
                             callback.invoke(origin, true, false)
                         }
-                        .setNegativeButton("Deny") { _, _ -> callback.invoke(origin, false, false) }
-                        .show()
+                        .setNegativeButton("Deny") { _, _ ->
+                            callback.invoke(origin, false, false)
+                        }.show()
                 }
             }
             override fun onShowFileChooser(
@@ -578,7 +544,8 @@ class WebAppActivity : AppCompatActivity() {
                         }.show()
                 } else {
                     fileChooserLauncher.launch(
-                        if (acceptTypes.isNotEmpty() && acceptTypes != "*/*") acceptTypes else "*/*"
+                        if (acceptTypes.isNotEmpty() && acceptTypes != "*/*")
+                            acceptTypes else "*/*"
                     )
                 }
                 return true
@@ -606,57 +573,76 @@ class WebAppActivity : AppCompatActivity() {
     // ── Cache helpers ─────────────────────────────────────────────────────────
 
     /**
-     * Decide which URLs to cache.
-     * Cache: model files, WASM, large JS bundles from known CDNs.
-     * Skip: API calls, HTML pages, short JSON responses.
+     * Stream a fully-downloaded file from disk to WebView.
+     * Uses a 512KB buffer — constant RAM, any file size.
      */
+    private fun streamFromDisk(file: File, url: String): WebResourceResponse {
+        return WebResourceResponse(
+            guessMime(url),
+            null,
+            200,
+            "OK",
+            mapOf(
+                "Access-Control-Allow-Origin" to "*",
+                "Content-Length"              to file.length().toString(),
+                "Cache-Control"               to "no-cache"
+            ),
+            FileInputStream(file)
+        )
+    }
+
+    private fun openConnection(url: String, request: WebResourceRequest): HttpURLConnection {
+        return (URL(url).openConnection() as HttpURLConnection).apply {
+            requestMethod        = "GET"
+            instanceFollowRedirects = true
+            connectTimeout       = 30_000
+            readTimeout          = 120_000  // 2 min for large files
+            request.requestHeaders?.forEach { (k, v) ->
+                if (!k.equals("Range", ignoreCase = true)) setRequestProperty(k, v)
+            }
+            connect()
+        }
+    }
+
     private fun shouldCache(url: String): Boolean {
         val lower = url.lowercase()
-        // Always cache these file types from any host
         val cacheExts = listOf(
             ".onnx", ".wasm", ".bin", ".ot", ".gguf",
             ".safetensors", ".pt", ".pth", ".tflite"
         )
         if (cacheExts.any { lower.contains(it) }) return true
-        // Cache HuggingFace and CDN model/JS files
         val cacheDomains = listOf(
             "huggingface.co", "cdn-lfs", "jsdelivr.net",
             "esm.run", "cdn.jsdelivr.net"
         )
         if (cacheDomains.any { lower.contains(it) }) {
-            // But skip small JSON/text files from these domains
             if (lower.endsWith(".html")) return false
             return true
         }
         return false
     }
 
-    /**
-     * Convert a URL to a stable cache file path.
-     * Uses a safe filename derived from the URL.
-     */
     private fun urlToCacheFile(url: String): File {
-        // Use last path segment + hash prefix to avoid collisions
-        val uri      = Uri.parse(url)
-        val lastSeg  = uri.lastPathSegment?.replace(Regex("[^a-zA-Z0-9._-]"), "_") ?: "file"
-        val hash     = url.hashCode().toLong() and 0xFFFFFFFFL
-        val name     = "${hash}_${lastSeg}".take(120)
-        // Group by host for easier debugging
-        val host     = uri.host?.replace(".", "_")?.take(30) ?: "misc"
+        val uri     = Uri.parse(url)
+        val lastSeg = uri.lastPathSegment
+            ?.replace(Regex("[^a-zA-Z0-9._-]"), "_") ?: "file"
+        val hash    = url.hashCode().toLong() and 0xFFFFFFFFL
+        val name    = "${hash}_${lastSeg}".take(120)
+        val host    = uri.host?.replace(".", "_")?.take(30) ?: "misc"
         return File(netCacheDir, "$host/$name")
     }
 
     private fun guessMime(url: String): String {
         val lower = url.lowercase().substringBefore("?")
         return when {
-            lower.endsWith(".onnx")         -> "application/octet-stream"
-            lower.endsWith(".wasm")         -> "application/wasm"
-            lower.endsWith(".json")         -> "application/json"
-            lower.endsWith(".js")           -> "application/javascript"
-            lower.endsWith(".mjs")          -> "application/javascript"
-            lower.endsWith(".bin")          -> "application/octet-stream"
+            lower.endsWith(".onnx")        -> "application/octet-stream"
+            lower.endsWith(".wasm")        -> "application/wasm"
+            lower.endsWith(".json")        -> "application/json"
+            lower.endsWith(".js")          -> "application/javascript"
+            lower.endsWith(".mjs")         -> "application/javascript"
+            lower.endsWith(".bin")         -> "application/octet-stream"
             lower.endsWith(".safetensors") -> "application/octet-stream"
-            else                            -> "application/octet-stream"
+            else                           -> "application/octet-stream"
         }
     }
 
