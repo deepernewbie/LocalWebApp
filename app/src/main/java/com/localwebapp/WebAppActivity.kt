@@ -138,23 +138,23 @@ class WebAppActivity : AppCompatActivity() {
 class SimpleServer(private val resolver: ContentResolver, private val rootUri: Uri) {
     private var socket: ServerSocket? = null
     var port = 0; private set
-    private val pool = Executors.newCachedThreadPool()
+    private val threadPool = Executors.newCachedThreadPool()
     @Volatile private var active = false
 
     fun start() {
         socket = ServerSocket(0).also { port = it.localPort }
         active = true
-        pool.submit {
+        threadPool.submit {
             while (active) {
                 try {
                     val client = socket!!.accept()
-                    pool.submit { try { handle(client) } finally { client.close() } }
+                    threadPool.submit { try { handle(client) } finally { client.close() } }
                 } catch (e: Exception) { if (active) e.printStackTrace() }
             }
         }
     }
 
-    fun stop() { active = false; try { socket?.close() } catch (e: Exception) {} pool.shutdownNow() }
+    fun stop() { active = false; try { socket?.close() } catch (e: Exception) {} threadPool.shutdownNow() }
 
     private fun handle(s: java.net.Socket) {
         val reader = s.inputStream.bufferedReader(Charsets.ISO_8859_1)
