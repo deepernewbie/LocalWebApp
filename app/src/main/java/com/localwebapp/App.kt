@@ -25,6 +25,7 @@ import com.google.android.material.floatingactionbutton.FloatingActionButton
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.File
+import java.io.FileOutputStream
 import java.io.OutputStream
 import java.net.ServerSocket
 import java.net.URLDecoder
@@ -269,9 +270,6 @@ class WebAppActivity : AppCompatActivity() {
             mixedContentMode = WebSettings.MIXED_CONTENT_COMPATIBILITY_MODE
         }
 
-        // Base models directory in app's private files
-        val modelsDir = File(filesDir, "models").also { it.mkdirs() }
-
         webView.addJavascriptInterface(object : Any() {
 
             // ── Basic bridge ──────────────────────────────────────────
@@ -304,90 +302,77 @@ class WebAppActivity : AppCompatActivity() {
                 }
             }
 
-            // ── File bridge (for QuizLens model storage) ──────────────
+            // ── File bridge ───────────────────────────────────────────
 
-            /**
-             * Write a base64-encoded file to app private storage.
-             * path is relative, e.g. "models/SmolVLM/onnx/decoder.onnx"
-             * Returns "ok" or "error: <message>"
-             */
             @JavascriptInterface
             fun writeFile(path: String, base64Data: String): String {
                 return try {
-                    val file = File(filesDir, sanitizePath(path))
+                    val file = File(filesDir, sanitize(path))
                     file.parentFile?.mkdirs()
                     val bytes = Base64.decode(base64Data, Base64.DEFAULT)
                     file.writeBytes(bytes)
                     "ok"
-                } catch (e: Exception) {
-                    "error: ${e.message}"
-                }
+                } catch (e: Exception) { "error: ${e.message}" }
             }
 
             /**
-             * Check if a file exists.
-             * Returns "true" or "false"
+             * Append a base64 chunk to a file — called repeatedly during
+             * streaming download so we never hold the whole file in RAM.
+             * First call creates/truncates the file.
              */
+            @JavascriptInterface
+            fun appendFile(path: String, base64Chunk: String, first: Boolean): String {
+                return try {
+                    val file = File(filesDir, sanitize(path))
+                    file.parentFile?.mkdirs()
+                    val bytes = Base64.decode(base64Chunk, Base64.DEFAULT)
+                    FileOutputStream(file, !first).use { it.write(bytes) }
+                    "ok"
+                } catch (e: Exception) { "error: ${e.message}" }
+            }
+
             @JavascriptInterface
             fun fileExists(path: String): String {
                 return try {
-                    File(filesDir, sanitizePath(path)).exists().toString()
-                } catch (e: Exception) {
-                    "false"
-                }
+                    File(filesDir, sanitize(path)).exists().toString()
+                } catch (e: Exception) { "false" }
             }
 
-            /**
-             * List files in a directory.
-             * Returns JSON array of filenames, e.g. ["decoder.onnx","config.json"]
-             * Returns "[]" if directory doesn't exist or on error.
-             */
+            @JavascriptInterface
+            fun fileSize(path: String): String {
+                return try {
+                    File(filesDir, sanitize(path)).length().toString()
+                } catch (e: Exception) { "0" }
+            }
+
             @JavascriptInterface
             fun listDir(path: String): String {
                 return try {
-                    val dir = File(filesDir, sanitizePath(path))
+                    val dir = File(filesDir, sanitize(path))
                     if (!dir.exists() || !dir.isDirectory) return "[]"
                     val arr = JSONArray()
                     dir.list()?.forEach { arr.put(it) }
                     arr.toString()
-                } catch (e: Exception) {
-                    "[]"
-                }
+                } catch (e: Exception) { "[]" }
             }
 
-            /**
-             * Read a file and return it as base64.
-             * Used by QuizLens to load cached model files back into memory.
-             * Returns base64 string or "error: <message>"
-             */
             @JavascriptInterface
             fun readFile(path: String): String {
                 return try {
-                    val file = File(filesDir, sanitizePath(path))
+                    val file = File(filesDir, sanitize(path))
                     if (!file.exists()) return "error: not found"
                     Base64.encodeToString(file.readBytes(), Base64.DEFAULT)
-                } catch (e: Exception) {
-                    "error: ${e.message}"
-                }
+                } catch (e: Exception) { "error: ${e.message}" }
             }
 
-            /**
-             * Delete a file or directory recursively.
-             * Returns "ok" or "error: <message>"
-             */
             @JavascriptInterface
             fun deleteFile(path: String): String {
                 return try {
-                    File(filesDir, sanitizePath(path)).deleteRecursively()
+                    File(filesDir, sanitize(path)).deleteRecursively()
                     "ok"
-                } catch (e: Exception) {
-                    "error: ${e.message}"
-                }
+                } catch (e: Exception) { "error: ${e.message}" }
             }
 
-            /**
-             * Get available storage in MB
-             */
             @JavascriptInterface
             fun getFreeMB(): String {
                 return try {
@@ -397,10 +382,8 @@ class WebAppActivity : AppCompatActivity() {
                 } catch (e: Exception) { "0" }
             }
 
-            // Prevent path traversal attacks
-            private fun sanitizePath(path: String): String {
-                return path.replace("..", "").trimStart('/')
-            }
+            private fun sanitize(path: String) =
+                path.replace("..", "").trimStart('/')
 
         }, "Android")
 
@@ -449,7 +432,6 @@ class WebAppActivity : AppCompatActivity() {
                     "[${m.messageLevel()}] ${m.message()} (line ${m.lineNumber()})")
                 return true
             }
-
             override fun onJsAlert(
                 view: WebView, url: String, message: String, result: JsResult
             ): Boolean {
@@ -486,7 +468,6 @@ class WebAppActivity : AppCompatActivity() {
                     .show()
                 return true
             }
-
             override fun onPermissionRequest(request: PermissionRequest) {
                 val androidPerms = mutableListOf<String>()
                 if (request.resources.contains(PermissionRequest.RESOURCE_VIDEO_CAPTURE))
@@ -506,7 +487,6 @@ class WebAppActivity : AppCompatActivity() {
                     permissionLauncher.launch(androidPerms.toTypedArray())
                 }
             }
-
             override fun onGeolocationPermissionsShowPrompt(
                 origin: String, callback: GeolocationPermissions.Callback
             ) {
@@ -529,7 +509,6 @@ class WebAppActivity : AppCompatActivity() {
                         .show()
                 }
             }
-
             override fun onShowFileChooser(
                 webView: WebView,
                 callback: ValueCallback<Array<Uri>>,
@@ -553,9 +532,7 @@ class WebAppActivity : AppCompatActivity() {
                                     filePathCallback?.onReceiveValue(null)
                                     filePathCallback = null
                                 }
-                            } else {
-                                fileChooserLauncher.launch("image/*")
-                            }
+                            } else fileChooserLauncher.launch("image/*")
                         }
                         .setOnCancelListener {
                             filePathCallback?.onReceiveValue(null)
@@ -575,25 +552,19 @@ class WebAppActivity : AppCompatActivity() {
             private var customViewCallback: CustomViewCallback? = null
 
             override fun onShowCustomView(view: View, callback: CustomViewCallback) {
-                customView = view
-                customViewCallback = callback
+                customView = view; customViewCallback = callback
                 window.decorView.systemUiVisibility = (
                     View.SYSTEM_UI_FLAG_FULLSCREEN or
                     View.SYSTEM_UI_FLAG_HIDE_NAVIGATION or
                     View.SYSTEM_UI_FLAG_IMMERSIVE_STICKY
                 )
                 (window.decorView as android.widget.FrameLayout).addView(
-                    view, android.widget.FrameLayout.LayoutParams(
-                        android.widget.FrameLayout.LayoutParams.MATCH_PARENT,
-                        android.widget.FrameLayout.LayoutParams.MATCH_PARENT
-                    )
+                    view, android.widget.FrameLayout.LayoutParams(-1, -1)
                 )
             }
-
             override fun onHideCustomView() {
                 (window.decorView as android.widget.FrameLayout).removeView(customView)
-                customView = null
-                customViewCallback?.onCustomViewHidden()
+                customView = null; customViewCallback?.onCustomViewHidden()
                 customViewCallback = null
                 window.decorView.systemUiVisibility = View.SYSTEM_UI_FLAG_VISIBLE
             }
@@ -606,17 +577,12 @@ class WebAppActivity : AppCompatActivity() {
         }
         return super.onKeyDown(keyCode, event)
     }
-
     override fun onSupportNavigateUp(): Boolean {
         onBackPressedDispatcher.onBackPressed(); return true
     }
-
     override fun onDestroy() {
-        super.onDestroy()
-        server?.stop()
-        webView.destroy()
+        super.onDestroy(); server?.stop(); webView.destroy()
     }
-
     override fun onPause() { super.onPause(); webView.onPause() }
     override fun onResume() { super.onResume(); webView.onResume() }
 }
@@ -641,9 +607,7 @@ class SimpleServer(
                     executor.submit {
                         try { handle(client) } finally { client.close() }
                     }
-                } catch (e: Exception) {
-                    if (active) e.printStackTrace()
-                }
+                } catch (e: Exception) { if (active) e.printStackTrace() }
             }
         }
     }
@@ -689,9 +653,7 @@ class SimpleServer(
             f.get(resolver) as android.content.Context
         } catch (e: Exception) { return null }
         var node = DocumentFile.fromTreeUri(ctx, rootUri) ?: return null
-        for (seg in segments) {
-            node = node.findFile(seg) ?: return null
-        }
+        for (seg in segments) { node = node.findFile(seg) ?: return null }
         return node
     }
 
@@ -699,44 +661,39 @@ class SimpleServer(
         val bytes = resolver.openInputStream(file.uri)?.use { it.readBytes() }
             ?: run { send404(out); return }
         val mime = getMime(file.name ?: "")
-        val header = "HTTP/1.1 200 OK\r\n" +
-            "Content-Type: $mime\r\n" +
-            "Content-Length: ${bytes.size}\r\n" +
-            "Access-Control-Allow-Origin: *\r\n" +
+        val header = "HTTP/1.1 200 OK\r\nContent-Type: $mime\r\n" +
+            "Content-Length: ${bytes.size}\r\nAccess-Control-Allow-Origin: *\r\n" +
             "Cache-Control: no-cache\r\n\r\n"
         out.write(header.toByteArray(Charsets.ISO_8859_1))
-        out.write(bytes)
-        out.flush()
+        out.write(bytes); out.flush()
     }
 
     private fun send404(out: OutputStream) {
         val body = "<h1>404 Not Found</h1>".toByteArray()
-        val header = "HTTP/1.1 404 Not Found\r\n" +
-            "Content-Type: text/html\r\n" +
+        val header = "HTTP/1.1 404 Not Found\r\nContent-Type: text/html\r\n" +
             "Content-Length: ${body.size}\r\n\r\n"
         out.write(header.toByteArray(Charsets.ISO_8859_1))
-        out.write(body)
-        out.flush()
+        out.write(body); out.flush()
     }
 
     private fun getMime(name: String) = when (
         name.substringAfterLast('.', "").lowercase()
     ) {
         "html", "htm" -> "text/html; charset=utf-8"
-        "css" -> "text/css; charset=utf-8"
-        "js", "mjs" -> "application/javascript; charset=utf-8"
-        "json" -> "application/json"
-        "png" -> "image/png"
+        "css"         -> "text/css; charset=utf-8"
+        "js", "mjs"   -> "application/javascript; charset=utf-8"
+        "json"        -> "application/json"
+        "png"         -> "image/png"
         "jpg", "jpeg" -> "image/jpeg"
-        "gif" -> "image/gif"
-        "svg" -> "image/svg+xml"
-        "webp" -> "image/webp"
-        "woff2" -> "font/woff2"
-        "woff" -> "font/woff"
-        "ttf" -> "font/ttf"
-        "mp4" -> "video/mp4"
-        "mp3" -> "audio/mpeg"
-        "wasm" -> "application/wasm"
-        else -> "application/octet-stream"
+        "gif"         -> "image/gif"
+        "svg"         -> "image/svg+xml"
+        "webp"        -> "image/webp"
+        "woff2"       -> "font/woff2"
+        "woff"        -> "font/woff"
+        "ttf"         -> "font/ttf"
+        "mp4"         -> "video/mp4"
+        "mp3"         -> "audio/mpeg"
+        "wasm"        -> "application/wasm"
+        else          -> "application/octet-stream"
     }
 }
