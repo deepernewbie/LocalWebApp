@@ -21,11 +21,16 @@ jobs:
       - name: Set up Android SDK
         uses: android-actions/setup-android@v3
 
+      - name: Install Gradle 8.2
+        uses: gradle/actions/setup-gradle@v3
+        with:
+          gradle-version: '8.2'
+
       - name: Build Debug APK
         run: |
-          gradle wrapper --gradle-version=8.2 --distribution-type=bin
+          gradle wrapper --gradle-version=8.2
           chmod +x ./gradlew
-          ./gradlew assembleDebug --no-daemon --stacktrace
+          ./gradlew assembleDebug --no-daemon
 
       - name: Upload APK
         uses: actions/upload-artifact@v4
