@@ -25,6 +25,7 @@ import com.google.android.material.floatingactionbutton.FloatingActionButton
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.File
+import java.io.FileInputStream
 import java.io.FileOutputStream
 import java.io.OutputStream
 import java.net.ServerSocket
@@ -272,7 +273,6 @@ class WebAppActivity : AppCompatActivity() {
 
         webView.addJavascriptInterface(object : Any() {
 
-            // ── Basic bridge ──────────────────────────────────────────
             @JavascriptInterface
             fun toast(msg: String) = runOnUiThread {
                 Toast.makeText(this@WebAppActivity, msg, Toast.LENGTH_SHORT).show()
@@ -309,16 +309,15 @@ class WebAppActivity : AppCompatActivity() {
                 return try {
                     val file = File(filesDir, sanitize(path))
                     file.parentFile?.mkdirs()
-                    val bytes = Base64.decode(base64Data, Base64.DEFAULT)
-                    file.writeBytes(bytes)
+                    file.writeBytes(Base64.decode(base64Data, Base64.DEFAULT))
                     "ok"
                 } catch (e: Exception) { "error: ${e.message}" }
             }
 
             /**
-             * Append a base64 chunk to a file — called repeatedly during
-             * streaming download so we never hold the whole file in RAM.
-             * First call creates/truncates the file.
+             * Append a base64 chunk to a file.
+             * first=true creates/truncates, first=false appends.
+             * Called once per ~64KB chunk so RAM stays flat.
              */
             @JavascriptInterface
             fun appendFile(path: String, base64Chunk: String, first: Boolean): String {
@@ -331,18 +330,44 @@ class WebAppActivity : AppCompatActivity() {
                 } catch (e: Exception) { "error: ${e.message}" }
             }
 
+            /**
+             * Read a file in chunks to avoid OOM on large files.
+             * offset = byte offset to start from.
+             * chunkSize = number of bytes to read (max ~1MB recommended).
+             * Returns base64 of the chunk, or "EOF" if past end, or "error:..."
+             */
             @JavascriptInterface
-            fun fileExists(path: String): String {
+            fun readFileChunk(path: String, offset: Long, chunkSize: Int): String {
                 return try {
-                    File(filesDir, sanitize(path)).exists().toString()
-                } catch (e: Exception) { "false" }
+                    val file = File(filesDir, sanitize(path))
+                    if (!file.exists()) return "error: not found"
+                    if (offset >= file.length()) return "EOF"
+                    val buf = ByteArray(chunkSize.coerceAtMost(
+                        (file.length() - offset).toInt().coerceAtMost(chunkSize)
+                    ))
+                    FileInputStream(file).use { fis ->
+                        fis.skip(offset)
+                        fis.read(buf)
+                    }
+                    Base64.encodeToString(buf, Base64.NO_WRAP)
+                } catch (e: Exception) { "error: ${e.message}" }
             }
 
+            /**
+             * Get file size in bytes. Returns "0" if not found.
+             */
             @JavascriptInterface
             fun fileSize(path: String): String {
                 return try {
                     File(filesDir, sanitize(path)).length().toString()
                 } catch (e: Exception) { "0" }
+            }
+
+            @JavascriptInterface
+            fun fileExists(path: String): String {
+                return try {
+                    File(filesDir, sanitize(path)).exists().toString()
+                } catch (e: Exception) { "false" }
             }
 
             @JavascriptInterface
@@ -356,12 +381,20 @@ class WebAppActivity : AppCompatActivity() {
                 } catch (e: Exception) { "[]" }
             }
 
+            /**
+             * Legacy readFile — only safe for small files (config JSON etc).
+             * For large binary files use readFileChunk instead.
+             */
             @JavascriptInterface
             fun readFile(path: String): String {
                 return try {
                     val file = File(filesDir, sanitize(path))
                     if (!file.exists()) return "error: not found"
-                    Base64.encodeToString(file.readBytes(), Base64.DEFAULT)
+                    // Safety limit — refuse to load files > 32MB in one call
+                    if (file.length() > 32 * 1024 * 1024) {
+                        return "error: file too large, use readFileChunk"
+                    }
+                    Base64.encodeToString(file.readBytes(), Base64.NO_WRAP)
                 } catch (e: Exception) { "error: ${e.message}" }
             }
 
@@ -419,7 +452,6 @@ class WebAppActivity : AppCompatActivity() {
         }
 
         webView.webChromeClient = object : WebChromeClient() {
-
             override fun onProgressChanged(v: WebView, p: Int) {
                 progressBar.progress = p
                 if (p == 100) progressBar.visibility = View.GONE
@@ -547,10 +579,8 @@ class WebAppActivity : AppCompatActivity() {
                 }
                 return true
             }
-
             private var customView: View? = null
             private var customViewCallback: CustomViewCallback? = null
-
             override fun onShowCustomView(view: View, callback: CustomViewCallback) {
                 customView = view; customViewCallback = callback
                 window.decorView.systemUiVisibility = (
@@ -559,8 +589,7 @@ class WebAppActivity : AppCompatActivity() {
                     View.SYSTEM_UI_FLAG_IMMERSIVE_STICKY
                 )
                 (window.decorView as android.widget.FrameLayout).addView(
-                    view, android.widget.FrameLayout.LayoutParams(-1, -1)
-                )
+                    view, android.widget.FrameLayout.LayoutParams(-1, -1))
             }
             override fun onHideCustomView() {
                 (window.decorView as android.widget.FrameLayout).removeView(customView)
