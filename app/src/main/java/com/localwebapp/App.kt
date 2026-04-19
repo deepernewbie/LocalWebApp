@@ -1,6 +1,7 @@
 package com.localwebapp
 
 import android.annotation.SuppressLint
+import android.app.Activity
 import android.content.ContentResolver
 import android.content.Intent
 import android.graphics.Bitmap
@@ -184,6 +185,7 @@ class WebAppActivity : AppCompatActivity() {
     companion object {
         const val EXTRA_URI = "extra_uri"
         const val EXTRA_TITLE = "extra_title"
+        private const val FILE_CHOOSER_REQUEST = 100
     }
 
     private lateinit var webView: WebView
@@ -191,17 +193,46 @@ class WebAppActivity : AppCompatActivity() {
     private lateinit var errorView: View
     private lateinit var errorText: TextView
     private var server: SimpleServer? = null
-    private var permissionRequest: PermissionRequest? = null
+    private var pendingPermissionRequest: PermissionRequest? = null
+    private var filePathCallback: ValueCallback<Array<Uri>>? = null
 
-    private val cameraPermissionLauncher =
-        registerForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
-            if (granted) {
-                permissionRequest?.grant(permissionRequest!!.resources)
+    // Single launcher for all dangerous permissions
+    private val permissionLauncher =
+        registerForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) { results ->
+            val allGranted = results.values.all { it }
+            if (allGranted) {
+                pendingPermissionRequest?.grant(pendingPermissionRequest!!.resources)
             } else {
-                permissionRequest?.deny()
+                pendingPermissionRequest?.deny()
             }
-            permissionRequest = null
+            pendingPermissionRequest = null
         }
+
+    // File chooser launcher
+    private val fileChooserLauncher =
+        registerForActivityResult(ActivityResultContracts.GetMultipleContents()) { uris ->
+            filePathCallback?.onReceiveValue(uris.toTypedArray())
+            filePathCallback = null
+        }
+
+    // Image capture launcher
+    private val imageCaptureUri by lazy {
+        androidx.core.content.FileProvider.getUriForFile(
+            this,
+            "${packageName}.fileprovider",
+            java.io.File(cacheDir, "capture_${System.currentTimeMillis()}.jpg")
+        )
+    }
+    private val imageCaptureCallback by lazy {
+        registerForActivityResult(ActivityResultContracts.TakePicture()) { success ->
+            if (success) {
+                filePathCallback?.onReceiveValue(arrayOf(imageCaptureUri))
+            } else {
+                filePathCallback?.onReceiveValue(null)
+            }
+            filePathCallback = null
+        }
+    }
 
     @SuppressLint("SetJavaScriptEnabled")
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -243,18 +274,23 @@ class WebAppActivity : AppCompatActivity() {
             setSupportZoom(true)
             builtInZoomControls = true
             displayZoomControls = false
+            // Allow autoplay audio/video without user gesture
             mediaPlaybackRequiresUserGesture = false
             mixedContentMode = WebSettings.MIXED_CONTENT_COMPATIBILITY_MODE
         }
 
+        // Android JS bridge
         webView.addJavascriptInterface(object : Any() {
             @JavascriptInterface
             fun toast(msg: String) = runOnUiThread {
                 Toast.makeText(this@WebAppActivity, msg, Toast.LENGTH_SHORT).show()
             }
-            @JavascriptInterface fun log(msg: String) = android.util.Log.d("WebApp", msg)
+            @JavascriptInterface fun log(msg: String) =
+                android.util.Log.d("WebApp", msg)
             @JavascriptInterface fun isNativeApp() = true
             @JavascriptInterface fun getPlatform() = "android"
+            @JavascriptInterface fun getAppVersion(): String =
+                packageManager.getPackageInfo(packageName, 0).versionName ?: "1.0"
             @JavascriptInterface fun share(text: String) = runOnUiThread {
                 startActivity(Intent.createChooser(
                     Intent(Intent.ACTION_SEND).apply {
@@ -262,6 +298,16 @@ class WebAppActivity : AppCompatActivity() {
                         putExtra(Intent.EXTRA_TEXT, text)
                     }, "Share"
                 ))
+            }
+            @JavascriptInterface fun vibrate() = runOnUiThread {
+                val v = getSystemService(android.content.Context.VIBRATOR_SERVICE)
+                        as android.os.Vibrator
+                if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.O) {
+                    v.vibrate(android.os.VibrationEffect.createOneShot(
+                        100, android.os.VibrationEffect.DEFAULT_AMPLITUDE))
+                } else {
+                    @Suppress("DEPRECATION") v.vibrate(100)
+                }
             }
         }, "Android")
 
@@ -287,12 +333,19 @@ class WebAppActivity : AppCompatActivity() {
             ): Boolean {
                 val url = req.url.toString()
                 if (url.startsWith("http://localhost")) return false
+                // Handle mailto, tel links natively
+                if (url.startsWith("mailto:") || url.startsWith("tel:")) {
+                    startActivity(Intent(Intent.ACTION_VIEW, req.url))
+                    return true
+                }
                 startActivity(Intent(Intent.ACTION_VIEW, req.url))
                 return true
             }
         }
 
         webView.webChromeClient = object : WebChromeClient() {
+
+            // ── Progress & title ──────────────────────────────────────
             override fun onProgressChanged(v: WebView, p: Int) {
                 progressBar.progress = p
                 if (p == 100) progressBar.visibility = View.GONE
@@ -301,24 +354,12 @@ class WebAppActivity : AppCompatActivity() {
                 supportActionBar?.title = t
             }
             override fun onConsoleMessage(m: ConsoleMessage): Boolean {
-                android.util.Log.d("WebApp-JS", m.message())
+                android.util.Log.d("WebApp-JS",
+                    "[${m.messageLevel()}] ${m.message()} (line ${m.lineNumber()})")
                 return true
             }
-            override fun onPermissionRequest(request: PermissionRequest) {
-                val needsCamera = request.resources.contains(PermissionRequest.RESOURCE_VIDEO_CAPTURE)
-                if (needsCamera) {
-                    if (checkSelfPermission(android.Manifest.permission.CAMERA) ==
-                        android.content.pm.PackageManager.PERMISSION_GRANTED
-                    ) {
-                        request.grant(request.resources)
-                    } else {
-                        permissionRequest = request
-                        cameraPermissionLauncher.launch(android.Manifest.permission.CAMERA)
-                    }
-                } else {
-                    request.grant(request.resources)
-                }
-            }
+
+            // ── JS Dialogs ────────────────────────────────────────────
             override fun onJsAlert(
                 view: WebView, url: String, message: String, result: JsResult
             ): Boolean {
@@ -336,8 +377,152 @@ class WebAppActivity : AppCompatActivity() {
                     .setMessage(message)
                     .setPositiveButton("OK") { _, _ -> result.confirm() }
                     .setNegativeButton("Cancel") { _, _ -> result.cancel() }
+                    .setOnCancelListener { result.cancel() }
                     .show()
                 return true
+            }
+            override fun onJsPrompt(
+                view: WebView, url: String, message: String,
+                defaultValue: String?, result: JsPromptResult
+            ): Boolean {
+                val input = android.widget.EditText(this@WebAppActivity)
+                input.setText(defaultValue ?: "")
+                AlertDialog.Builder(this@WebAppActivity)
+                    .setMessage(message)
+                    .setView(input)
+                    .setPositiveButton("OK") { _, _ -> result.confirm(input.text.toString()) }
+                    .setNegativeButton("Cancel") { _, _ -> result.cancel() }
+                    .setOnCancelListener { result.cancel() }
+                    .show()
+                return true
+            }
+
+            // ── Camera / Mic / Geolocation permissions ────────────────
+            override fun onPermissionRequest(request: PermissionRequest) {
+                val androidPerms = mutableListOf<String>()
+                if (request.resources.contains(PermissionRequest.RESOURCE_VIDEO_CAPTURE)) {
+                    androidPerms.add(android.Manifest.permission.CAMERA)
+                }
+                if (request.resources.contains(PermissionRequest.RESOURCE_AUDIO_CAPTURE)) {
+                    androidPerms.add(android.Manifest.permission.RECORD_AUDIO)
+                }
+                if (androidPerms.isEmpty()) {
+                    request.grant(request.resources)
+                    return
+                }
+                val allAlreadyGranted = androidPerms.all {
+                    checkSelfPermission(it) ==
+                        android.content.pm.PackageManager.PERMISSION_GRANTED
+                }
+                if (allAlreadyGranted) {
+                    request.grant(request.resources)
+                } else {
+                    pendingPermissionRequest = request
+                    permissionLauncher.launch(androidPerms.toTypedArray())
+                }
+            }
+
+            // ── Geolocation ───────────────────────────────────────────
+            override fun onGeolocationPermissionsShowPrompt(
+                origin: String,
+                callback: GeolocationPermissions.Callback
+            ) {
+                val fineLocation = android.Manifest.permission.ACCESS_FINE_LOCATION
+                val coarseLocation = android.Manifest.permission.ACCESS_COARSE_LOCATION
+                if (checkSelfPermission(fineLocation) ==
+                    android.content.pm.PackageManager.PERMISSION_GRANTED) {
+                    callback.invoke(origin, true, false)
+                } else {
+                    AlertDialog.Builder(this@WebAppActivity)
+                        .setTitle("Location Access")
+                        .setMessage("This app wants to access your location.")
+                        .setPositiveButton("Allow") { _, _ ->
+                            permissionLauncher.launch(
+                                arrayOf(fineLocation, coarseLocation)
+                            )
+                            callback.invoke(origin, true, false)
+                        }
+                        .setNegativeButton("Deny") { _, _ ->
+                            callback.invoke(origin, false, false)
+                        }
+                        .show()
+                }
+            }
+
+            // ── File chooser (input type=file) ────────────────────────
+            override fun onShowFileChooser(
+                webView: WebView,
+                callback: ValueCallback<Array<Uri>>,
+                params: FileChooserParams
+            ): Boolean {
+                filePathCallback?.onReceiveValue(null)
+                filePathCallback = callback
+                val acceptTypes = params.acceptTypes.joinToString(",")
+                val isImage = acceptTypes.contains("image")
+                val isCapture = params.isCaptureEnabled
+                if (isImage && isCapture) {
+                    // Use camera directly
+                    try {
+                        imageCaptureCallback.launch(imageCaptureUri)
+                        return true
+                    } catch (e: Exception) { /* fall through to picker */ }
+                }
+                // Show dialog: pick from gallery or take photo
+                if (isImage) {
+                    AlertDialog.Builder(this@WebAppActivity)
+                        .setTitle("Get Image")
+                        .setItems(arrayOf("Take Photo", "Choose from Gallery")) { _, which ->
+                            if (which == 0) {
+                                try { imageCaptureCallback.launch(imageCaptureUri) }
+                                catch (e: Exception) {
+                                    filePathCallback?.onReceiveValue(null)
+                                    filePathCallback = null
+                                }
+                            } else {
+                                fileChooserLauncher.launch("image/*")
+                            }
+                        }
+                        .setOnCancelListener {
+                            filePathCallback?.onReceiveValue(null)
+                            filePathCallback = null
+                        }
+                        .show()
+                } else {
+                    fileChooserLauncher.launch(
+                        if (acceptTypes.isNotEmpty() && acceptTypes != "*/*")
+                            acceptTypes else "*/*"
+                    )
+                }
+                return true
+            }
+
+            // ── Fullscreen video ──────────────────────────────────────
+            private var customView: View? = null
+            private var customViewCallback: CustomViewCallback? = null
+
+            override fun onShowCustomView(view: View, callback: CustomViewCallback) {
+                customView = view
+                customViewCallback = callback
+                window.decorView.systemUiVisibility = (
+                    View.SYSTEM_UI_FLAG_FULLSCREEN or
+                    View.SYSTEM_UI_FLAG_HIDE_NAVIGATION or
+                    View.SYSTEM_UI_FLAG_IMMERSIVE_STICKY
+                )
+                (window.decorView as android.widget.FrameLayout).addView(
+                    view, android.widget.FrameLayout.LayoutParams(
+                        android.widget.FrameLayout.LayoutParams.MATCH_PARENT,
+                        android.widget.FrameLayout.LayoutParams.MATCH_PARENT
+                    )
+                )
+            }
+
+            override fun onHideCustomView() {
+                (window.decorView as android.widget.FrameLayout)
+                    .removeView(customView)
+                customView = null
+                customViewCallback?.onCustomViewHidden()
+                customViewCallback = null
+                window.decorView.systemUiVisibility = View.SYSTEM_UI_FLAG_VISIBLE
             }
         }
     }
