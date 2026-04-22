@@ -1,60 +1,10 @@
-<?xml version="1.0" encoding="utf-8"?>
-<androidx.cardview.widget.CardView
-    xmlns:android="http://schemas.android.com/apk/res/android"
-    xmlns:app="http://schemas.android.com/apk/res-auto"
-    android:layout_width="match_parent"
-    android:layout_height="wrap_content"
-    android:layout_marginHorizontal="12dp"
-    android:layout_marginTop="8dp"
-    android:clickable="true"
-    android:focusable="true"
-    app:cardCornerRadius="12dp"
-    app:cardElevation="2dp"
-    app:cardBackgroundColor="#FFFFFF">
-
-    <LinearLayout
-        android:layout_width="match_parent"
-        android:layout_height="wrap_content"
-        android:orientation="horizontal"
-        android:padding="16dp"
-        android:gravity="center_vertical">
-
-        <LinearLayout
-            android:layout_width="0dp"
-            android:layout_height="wrap_content"
-            android:layout_weight="1"
-            android:orientation="vertical">
-
-            <TextView
-                android:id="@+id/projectName"
-                android:layout_width="wrap_content"
-                android:layout_height="wrap_content"
-                android:textSize="16sp"
-                android:textColor="#202124"
-                android:textStyle="bold"
-                android:maxLines="1"
-                android:ellipsize="end" />
-
-            <TextView
-                android:id="@+id/projectDate"
-                android:layout_width="wrap_content"
-                android:layout_height="wrap_content"
-                android:textSize="12sp"
-                android:textColor="#5F6368"
-                android:layout_marginTop="2dp" />
-
-        </LinearLayout>
-
-        <ImageButton
-            android:id="@+id/deleteButton"
-            android:layout_width="36dp"
-            android:layout_height="36dp"
-            android:src="@android:drawable/ic_menu_delete"
-            android:background="?attr/selectableItemBackgroundBorderless"
-            android:contentDescription="Remove"
-            android:padding="6dp"
-            android:alpha="0.5" />
-
-    </LinearLayout>
-
+<androidx.cardview.widget.CardView xmlns:android="http://schemas.android.com/apk/res/android" xmlns:app="http://schemas.android.com/apk/res-auto" android:layout_width="match_parent" android:layout_height="wrap_content" android:layout_marginHorizontal="12dp" android:layout_marginTop="8dp" android:clickable="true" android:focusable="true" app:cardCornerRadius="12dp" app:cardElevation="2dp" app:cardBackgroundColor="#FFFFFF">
+<LinearLayout android:layout_width="match_parent" android:layout_height="wrap_content" android:orientation="horizontal" android:padding="16dp" android:gravity="center_vertical">
+<LinearLayout android:layout_width="0dp" android:layout_height="wrap_content" android:layout_weight="1" android:orientation="vertical">
+<TextView android:id="@+id/projectName" android:layout_width="wrap_content" android:layout_height="wrap_content" android:textSize="16sp" android:textColor="#202124" android:textStyle="bold" android:maxLines="1" android:ellipsize="end"/>
+<TextView android:id="@+id/projectDate" android:layout_width="wrap_content" android:layout_height="wrap_content" android:textSize="12sp" android:textColor="#5F6368" android:layout_marginTop="2dp"/>
+</LinearLayout>
+<ImageButton android:id="@+id/shortcutButton" android:layout_width="36dp" android:layout_height="36dp" android:src="@android:drawable/ic_menu_add" android:background="?attr/selectableItemBackgroundBorderless" android:contentDescription="Add to home screen" android:padding="6dp" android:alpha="0.5"/>
+<ImageButton android:id="@+id/deleteButton" android:layout_width="36dp" android:layout_height="36dp" android:src="@android:drawable/ic_menu_delete" android:background="?attr/selectableItemBackgroundBorderless" android:contentDescription="Remove" android:padding="6dp" android:alpha="0.5"/>
+</LinearLayout>
 </androidx.cardview.widget.CardView>
