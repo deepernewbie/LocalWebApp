@@ -27,6 +27,7 @@ import android.widget.Toast
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AlertDialog
 import androidx.appcompat.app.AppCompatActivity
+import androidx.core.app.ActivityCompat
 import androidx.core.content.pm.ShortcutInfoCompat
 import androidx.core.content.pm.ShortcutManagerCompat
 import androidx.core.graphics.drawable.IconCompat
@@ -75,8 +76,8 @@ class RecentProjectsAdapter(
         holder.name.text = project.name
         val sdf = SimpleDateFormat("MMM dd, yyyy HH:mm", Locale.getDefault())
         holder.date.text = "Last opened: ${sdf.format(Date(project.lastOpened))}"
-        holder.itemView.setOnClickListener   { onOpen(project) }
-        holder.deleteBtn.setOnClickListener  { onDelete(project) }
+        holder.itemView.setOnClickListener    { onOpen(project) }
+        holder.deleteBtn.setOnClickListener   { onDelete(project) }
         holder.shortcutBtn.setOnClickListener { onShortcut(project) }
     }
 
@@ -134,7 +135,6 @@ class MainActivity : AppCompatActivity() {
             val uri   = intent.getStringExtra("uri")
             val title = intent.getStringExtra("title") ?: "Web App"
             if (uri != null) {
-                // Update "last opened" timestamp without touching views
                 try {
                     val arr = loadJson()
                     val filtered = (0 until arr.length())
@@ -147,11 +147,8 @@ class MainActivity : AppCompatActivity() {
                     val out = JSONArray()
                     filtered.take(20).forEach { out.put(it) }
                     prefs.edit().putString("projects", out.toString()).apply()
-                } catch (e: Exception) {
-                    // Non-fatal — still launch
-                }
+                } catch (e: Exception) { /* non-fatal */ }
 
-                // Launch WebAppActivity directly, skip the picker UI
                 val launchIntent = Intent(this, WebAppActivity::class.java).apply {
                     putExtra(WebAppActivity.EXTRA_URI, uri)
                     putExtra(WebAppActivity.EXTRA_TITLE, title)
@@ -162,7 +159,6 @@ class MainActivity : AppCompatActivity() {
             }
         }
 
-        // Normal launch — show project picker
         setContentView(R.layout.activity_main)
         setSupportActionBar(findViewById(R.id.toolbar))
         recyclerView = findViewById(R.id.recyclerView)
@@ -199,10 +195,6 @@ class MainActivity : AppCompatActivity() {
         startActivity(intent)
     }
 
-    /**
-     * Create a launcher icon on the user's home screen that opens
-     * this specific web app directly, skipping the picker screen.
-     */
     private fun createShortcut(project: RecentProject) {
         if (!ShortcutManagerCompat.isRequestPinShortcutSupported(this)) {
             Toast.makeText(this,
@@ -239,10 +231,6 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    /**
-     * Draws a 192x192 rounded-square icon with a single letter,
-     * colored from a hash of the app name so each app gets its own color.
-     */
     private fun makeLetterIcon(letter: String): Bitmap {
         val size    = 192
         val bitmap  = Bitmap.createBitmap(size, size, Bitmap.Config.ARGB_8888)
@@ -320,6 +308,7 @@ class WebAppActivity : AppCompatActivity() {
         const val EXTRA_URI = "extra_uri"
         const val EXTRA_TITLE = "extra_title"
         private const val NET_CACHE = "netcache"
+        private const val STARTUP_PERM_REQ = 9001
     }
 
     private lateinit var webView: WebView
@@ -337,37 +326,6 @@ class WebAppActivity : AppCompatActivity() {
             else pendingPermissionRequest?.deny()
             pendingPermissionRequest = null
         }
-
-    /**
-     * Runtime permissions requested eagerly at activity start, *before*
-     * the WebView tries to use getUserMedia. Required on Android 6+ and
-     * especially aggressive on Samsung One UI — WebView's
-     * PermissionRequest.grant() silently fails when the underlying OS
-     * grant isn't already in place, producing a misleading
-     * NotReadableError: "Could not start audio source" with an empty
-     * MediaDeviceInfo.label.
-     */
-    private val startupPermissionLauncher =
-        registerForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) { _ ->
-            android.util.Log.d("WebApp", "Startup permissions result received")
-        }
-
-    private fun requestStartupPermissions() {
-        val needed = mutableListOf<String>()
-        val want = listOf(
-            android.Manifest.permission.RECORD_AUDIO,
-            android.Manifest.permission.CAMERA
-        )
-        for (p in want) {
-            if (checkSelfPermission(p) !=
-                android.content.pm.PackageManager.PERMISSION_GRANTED) {
-                needed.add(p)
-            }
-        }
-        if (needed.isNotEmpty()) {
-            startupPermissionLauncher.launch(needed.toTypedArray())
-        }
-    }
 
     private val fileChooserLauncher =
         registerForActivityResult(ActivityResultContracts.GetMultipleContents()) { uris ->
@@ -403,12 +361,6 @@ class WebAppActivity : AppCompatActivity() {
 
         setContentView(R.layout.activity_webapp)
 
-        // Request runtime permissions BEFORE the WebView loads the page.
-        // Without this, Samsung WebView's getUserMedia returns an opaque
-        // NotReadableError because the OS mic grant doesn't exist yet
-        // when the page asks for it.
-        requestStartupPermissions()
-
         val uriStr    = intent.getStringExtra(EXTRA_URI) ?: run { finish(); return }
         val title     = intent.getStringExtra(EXTRA_TITLE) ?: "Web App"
         val folderUri = Uri.parse(uriStr)
@@ -417,6 +369,27 @@ class WebAppActivity : AppCompatActivity() {
         progressBar = findViewById(R.id.progressBar)
         errorView   = findViewById(R.id.errorView)
         errorText   = findViewById(R.id.errorText)
+
+        // ══════════════════════════════════════════════════════════════════
+        // Pre-request mic + camera permissions at Activity start.
+        // This primes Android's audio policy manager so the WebView later
+        // gets a clean audio handle. Without this, WebView mic requests may
+        // succeed on permission check but fail with NotReadableError because
+        // the audio device isn't properly allocated to our process.
+        // ══════════════════════════════════════════════════════════════════
+        val neededPerms = mutableListOf<String>()
+        if (checkSelfPermission(android.Manifest.permission.RECORD_AUDIO)
+            != android.content.pm.PackageManager.PERMISSION_GRANTED) {
+            neededPerms.add(android.Manifest.permission.RECORD_AUDIO)
+        }
+        if (checkSelfPermission(android.Manifest.permission.CAMERA)
+            != android.content.pm.PackageManager.PERMISSION_GRANTED) {
+            neededPerms.add(android.Manifest.permission.CAMERA)
+        }
+        if (neededPerms.isNotEmpty()) {
+            ActivityCompat.requestPermissions(
+                this, neededPerms.toTypedArray(), STARTUP_PERM_REQ)
+        }
 
         val s = SimpleServer(contentResolver, folderUri, filesDir)
         server = s
@@ -622,20 +595,33 @@ class WebAppActivity : AppCompatActivity() {
                 return true
             }
             override fun onPermissionRequest(request: PermissionRequest) {
-                val perms = mutableListOf<String>()
-                if (request.resources.contains(PermissionRequest.RESOURCE_VIDEO_CAPTURE))
-                    perms.add(android.Manifest.permission.CAMERA)
-                if (request.resources.contains(PermissionRequest.RESOURCE_AUDIO_CAPTURE))
-                    perms.add(android.Manifest.permission.RECORD_AUDIO)
-                if (perms.isEmpty()) { request.grant(request.resources); return }
-                val allGranted = perms.all {
-                    checkSelfPermission(it) ==
-                        android.content.pm.PackageManager.PERMISSION_GRANTED
-                }
-                if (allGranted) request.grant(request.resources)
-                else {
-                    pendingPermissionRequest = request
-                    permissionLauncher.launch(perms.toTypedArray())
+                runOnUiThread {
+                    android.util.Log.d("WebApp-Perm",
+                        "Permission requested: ${request.resources.joinToString()}")
+                    val perms = mutableListOf<String>()
+                    if (request.resources.contains(PermissionRequest.RESOURCE_VIDEO_CAPTURE))
+                        perms.add(android.Manifest.permission.CAMERA)
+                    if (request.resources.contains(PermissionRequest.RESOURCE_AUDIO_CAPTURE))
+                        perms.add(android.Manifest.permission.RECORD_AUDIO)
+
+                    if (perms.isEmpty()) {
+                        request.grant(request.resources)
+                        return@runOnUiThread
+                    }
+
+                    val allGranted = perms.all {
+                        checkSelfPermission(it) ==
+                            android.content.pm.PackageManager.PERMISSION_GRANTED
+                    }
+                    android.util.Log.d("WebApp-Perm",
+                        "OS perms granted=$allGranted, needed=${perms.joinToString()}")
+
+                    if (allGranted) {
+                        request.grant(request.resources)
+                    } else {
+                        pendingPermissionRequest = request
+                        permissionLauncher.launch(perms.toTypedArray())
+                    }
                 }
             }
             override fun onGeolocationPermissionsShowPrompt(
