@@ -3,15 +3,24 @@ package com.localwebapp
 import android.annotation.SuppressLint
 import android.content.ContentResolver
 import android.content.Intent
+import android.content.pm.ShortcutInfo
+import android.content.pm.ShortcutManager
 import android.graphics.Bitmap
+import android.graphics.Canvas
+import android.graphics.Color
+import android.graphics.Paint
+import android.graphics.drawable.Icon
 import android.net.Uri
+import android.os.Build
 import android.os.Bundle
 import android.util.Base64
 import android.view.KeyEvent
 import android.view.LayoutInflater
 import android.view.View
 import android.view.ViewGroup
+import android.view.WindowManager
 import android.webkit.*
+import android.widget.ImageButton
 import android.widget.ProgressBar
 import android.widget.TextView
 import android.widget.Toast
@@ -30,7 +39,6 @@ import org.json.JSONObject
 import java.io.File
 import java.io.FileInputStream
 import java.io.FileOutputStream
-import java.io.InputStream
 import java.io.OutputStream
 import java.net.HttpURLConnection
 import java.net.ServerSocket
@@ -44,16 +52,16 @@ data class RecentProject(val name: String, val uri: String, val lastOpened: Long
 
 class RecentProjectsAdapter(
     private var projects: MutableList<RecentProject>,
-    private val onOpen: (RecentProject) -> Unit,
-    private val onDelete: (RecentProject) -> Unit,
+    private val onOpen:     (RecentProject) -> Unit,
+    private val onDelete:   (RecentProject) -> Unit,
     private val onShortcut: (RecentProject) -> Unit
 ) : RecyclerView.Adapter<RecentProjectsAdapter.ViewHolder>() {
 
     inner class ViewHolder(view: View) : RecyclerView.ViewHolder(view) {
-        val name: TextView = view.findViewById(R.id.projectName)
-        val date: TextView = view.findViewById(R.id.projectDate)
-        val deleteBtn: View = view.findViewById(R.id.deleteButton)
-        val shortcutBtn: View = view.findViewById(R.id.shortcutButton)
+        val name: TextView      = view.findViewById(R.id.projectName)
+        val date: TextView      = view.findViewById(R.id.projectDate)
+        val deleteBtn: View     = view.findViewById(R.id.deleteButton)
+        val shortcutBtn: View   = view.findViewById(R.id.shortcutButton)
     }
 
     override fun onCreateViewHolder(parent: ViewGroup, viewType: Int): ViewHolder {
@@ -67,7 +75,7 @@ class RecentProjectsAdapter(
         holder.name.text = project.name
         val sdf = SimpleDateFormat("MMM dd, yyyy HH:mm", Locale.getDefault())
         holder.date.text = "Last opened: ${sdf.format(Date(project.lastOpened))}"
-        holder.itemView.setOnClickListener { onOpen(project) }
+        holder.itemView.setOnClickListener  { onOpen(project) }
         holder.deleteBtn.setOnClickListener { onDelete(project) }
         holder.shortcutBtn.setOnClickListener { onShortcut(project) }
     }
@@ -116,13 +124,26 @@ class MainActivity : AppCompatActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+
+        // Handle launch from home screen shortcut
+        if (intent?.action == "com.localwebapp.OPEN_SHORTCUT") {
+            val uri   = intent.getStringExtra("uri")
+            val title = intent.getStringExtra("title") ?: "Web App"
+            if (uri != null) {
+                launchWebApp(Uri.parse(uri), title)
+                finish()
+                return
+            }
+        }
+
         setContentView(R.layout.activity_main)
         setSupportActionBar(findViewById(R.id.toolbar))
         recyclerView = findViewById(R.id.recyclerView)
-        emptyView = findViewById(R.id.emptyView)
+        emptyView    = findViewById(R.id.emptyView)
+
         adapter = RecentProjectsAdapter(
             mutableListOf(),
-            onOpen = { launchWebApp(Uri.parse(it.uri), it.name) },
+            onOpen   = { launchWebApp(Uri.parse(it.uri), it.name) },
             onDelete = {
                 AlertDialog.Builder(this)
                     .setTitle("Remove \"${it.name}\"?")
@@ -130,86 +151,15 @@ class MainActivity : AppCompatActivity() {
                     .setNegativeButton("Cancel", null)
                     .show()
             },
-            onShortcut = { pinShortcut(it) }
+            onShortcut = { createShortcut(it) }
         )
         recyclerView.layoutManager = LinearLayoutManager(this)
         recyclerView.adapter = adapter
+
         findViewById<FloatingActionButton>(R.id.fab).setOnClickListener {
             openFolderLauncher.launch(null)
         }
         loadProjects()
-
-        // If this instance was launched from a homescreen shortcut, jump
-        // straight to the web app without showing the picker.
-        handleShortcutIntent(intent)
-    }
-
-    override fun onNewIntent(intent: Intent) {
-        super.onNewIntent(intent)
-        setIntent(intent)
-        handleShortcutIntent(intent)
-    }
-
-    /**
-     * Shortcuts launch MainActivity with EXTRA_SHORTCUT_URI / NAME set.
-     * We forward immediately to WebAppActivity and finish ourselves so
-     * pressing back from the web app exits cleanly instead of landing
-     * on the project list.
-     */
-    private fun handleShortcutIntent(intent: Intent?) {
-        val uri  = intent?.getStringExtra(EXTRA_SHORTCUT_URI) ?: return
-        val name = intent.getStringExtra(EXTRA_SHORTCUT_NAME) ?: "Web App"
-        // Clear so rotation / re-resume doesn't re-forward.
-        intent.removeExtra(EXTRA_SHORTCUT_URI)
-        intent.removeExtra(EXTRA_SHORTCUT_NAME)
-        launchWebApp(Uri.parse(uri), name)
-        finish()
-    }
-
-    /**
-     * Request the launcher to pin a shortcut for this web app. Tapping
-     * the shortcut fires an Intent back into MainActivity with the URI
-     * extras, which we intercept above.
-     *
-     * Requires a launcher that supports pin shortcuts (most modern ones
-     * do). On unsupported launchers we fall back to a toast explaining
-     * the limitation.
-     */
-    private fun pinShortcut(p: RecentProject) {
-        if (!ShortcutManagerCompat.isRequestPinShortcutSupported(this)) {
-            Toast.makeText(
-                this,
-                "Your launcher doesn't support pinning shortcuts.",
-                Toast.LENGTH_LONG
-            ).show()
-            return
-        }
-        val launchIntent = Intent(this, MainActivity::class.java).apply {
-            action = Intent.ACTION_VIEW
-            addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TASK)
-            putExtra(EXTRA_SHORTCUT_URI, p.uri)
-            putExtra(EXTRA_SHORTCUT_NAME, p.name)
-        }
-        // Stable id per URI so re-pinning updates the same entry.
-        val id = "webapp_" + (p.uri.hashCode().toLong() and 0xFFFFFFFFL).toString(16)
-        val shortcut = ShortcutInfoCompat.Builder(this, id)
-            .setShortLabel(p.name.take(10))
-            .setLongLabel(p.name.take(25))
-            .setIcon(IconCompat.createWithResource(this, R.mipmap.ic_launcher))
-            .setIntent(launchIntent)
-            .build()
-        val ok = ShortcutManagerCompat.requestPinShortcut(this, shortcut, null)
-        Toast.makeText(
-            this,
-            if (ok) "Shortcut requested — confirm in launcher"
-            else    "Could not request shortcut",
-            Toast.LENGTH_SHORT
-        ).show()
-    }
-
-    companion object {
-        const val EXTRA_SHORTCUT_URI  = "shortcut_uri"
-        const val EXTRA_SHORTCUT_NAME = "shortcut_name"
     }
 
     override fun onResume() { super.onResume(); loadProjects() }
@@ -220,6 +170,79 @@ class MainActivity : AppCompatActivity() {
         intent.putExtra(WebAppActivity.EXTRA_URI, uri.toString())
         intent.putExtra(WebAppActivity.EXTRA_TITLE, name)
         startActivity(intent)
+    }
+
+    /**
+     * Create a launcher icon on the user's home screen that opens
+     * this specific web app directly, skipping the picker screen.
+     */
+    private fun createShortcut(project: RecentProject) {
+        if (!ShortcutManagerCompat.isRequestPinShortcutSupported(this)) {
+            Toast.makeText(this,
+                "Your launcher doesn't support pinning shortcuts",
+                Toast.LENGTH_LONG).show()
+            return
+        }
+
+        val shortcutIntent = Intent(this, MainActivity::class.java).apply {
+            action = "com.localwebapp.OPEN_SHORTCUT"
+            putExtra("uri",   project.uri)
+            putExtra("title", project.name)
+            addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TASK)
+        }
+
+        // Generate a simple colored-letter icon from the first letter of the app name
+        val iconBitmap = makeLetterIcon(project.name.firstOrNull()?.uppercase() ?: "W")
+
+        val shortcut = ShortcutInfoCompat.Builder(this, "webapp_${project.uri.hashCode()}")
+            .setShortLabel(project.name.take(24))
+            .setLongLabel(project.name.take(48))
+            .setIcon(IconCompat.createWithBitmap(iconBitmap))
+            .setIntent(shortcutIntent)
+            .build()
+
+        val success = ShortcutManagerCompat.requestPinShortcut(this, shortcut, null)
+        if (success) {
+            Toast.makeText(this,
+                "Shortcut added — check your home screen",
+                Toast.LENGTH_SHORT).show()
+        } else {
+            Toast.makeText(this,
+                "Could not add shortcut — drag it from the shortcut menu",
+                Toast.LENGTH_LONG).show()
+        }
+    }
+
+    /**
+     * Draws a 192x192 rounded-square icon with a single letter,
+     * colored from a hash of the app name so each app gets its own color.
+     */
+    private fun makeLetterIcon(letter: String): Bitmap {
+        val size    = 192
+        val bitmap  = Bitmap.createBitmap(size, size, Bitmap.Config.ARGB_8888)
+        val canvas  = Canvas(bitmap)
+
+        val colors = listOf(
+            Color.parseColor("#6366F1"), Color.parseColor("#EC4899"),
+            Color.parseColor("#10B981"), Color.parseColor("#F59E0B"),
+            Color.parseColor("#EF4444"), Color.parseColor("#8B5CF6"),
+            Color.parseColor("#06B6D4"), Color.parseColor("#F97316")
+        )
+        val color = colors[Math.abs(letter.hashCode()) % colors.size]
+
+        val bgPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply { this.color = color }
+        canvas.drawRoundRect(0f, 0f, size.toFloat(), size.toFloat(), 40f, 40f, bgPaint)
+
+        val textPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            this.color  = Color.WHITE
+            textSize    = 110f
+            textAlign   = Paint.Align.CENTER
+            isFakeBoldText = true
+        }
+        val yOffset = (textPaint.descent() + textPaint.ascent()) / 2
+        canvas.drawText(letter, size / 2f, size / 2f - yOffset, textPaint)
+
+        return bitmap
     }
 
     private fun saveProject(name: String, uriStr: String) {
@@ -260,8 +283,8 @@ class MainActivity : AppCompatActivity() {
             RecentProject(o.getString("name"), o.getString("uri"), o.getLong("lastOpened"))
         }
         adapter.updateProjects(list)
-        emptyView.visibility = if (list.isEmpty()) View.VISIBLE else View.GONE
-        recyclerView.visibility = if (list.isEmpty()) View.GONE else View.VISIBLE
+        emptyView.visibility     = if (list.isEmpty()) View.VISIBLE else View.GONE
+        recyclerView.visibility  = if (list.isEmpty()) View.GONE    else View.VISIBLE
     }
 }
 
@@ -277,7 +300,6 @@ class WebAppActivity : AppCompatActivity() {
     private lateinit var progressBar: ProgressBar
     private lateinit var errorView: View
     private lateinit var errorText: TextView
-    private lateinit var appBar: View
     private var server: SimpleServer? = null
     private var pendingPermissionRequest: PermissionRequest? = null
     private var filePathCallback: ValueCallback<Array<Uri>>? = null
@@ -318,27 +340,22 @@ class WebAppActivity : AppCompatActivity() {
     @SuppressLint("SetJavaScriptEnabled")
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+
+        // ── Full-screen: web app owns the whole screen ──
+        // Hide system action bar, go edge-to-edge, let the web app
+        // paint under the status bar if it wants to.
+        supportActionBar?.hide()
+
         setContentView(R.layout.activity_webapp)
 
-        val uriStr = intent.getStringExtra(EXTRA_URI) ?: run { finish(); return }
-        val title  = intent.getStringExtra(EXTRA_TITLE) ?: "Web App"
+        val uriStr    = intent.getStringExtra(EXTRA_URI) ?: run { finish(); return }
+        val title     = intent.getStringExtra(EXTRA_TITLE) ?: "Web App"
         val folderUri = Uri.parse(uriStr)
 
-        // The AppBar (toolbar + progress bar) is hidden by default in
-        // the layout so the web app can use its full screen with its
-        // own header/theme. We still call setSupportActionBar so
-        // back-button handling works, and we reveal the bar on error.
-        appBar = findViewById(R.id.appBar)
-        setSupportActionBar(findViewById(R.id.toolbar))
-        supportActionBar?.apply {
-            this.title = title
-            setDisplayHomeAsUpEnabled(true)
-        }
-
-        webView     = findViewById(R.id.webView)
-        progressBar = findViewById(R.id.progressBar)
-        errorView   = findViewById(R.id.errorView)
-        errorText   = findViewById(R.id.errorText)
+        webView      = findViewById(R.id.webView)
+        progressBar  = findViewById(R.id.progressBar)
+        errorView    = findViewById(R.id.errorView)
+        errorText    = findViewById(R.id.errorText)
 
         val s = SimpleServer(contentResolver, folderUri, filesDir)
         server = s
@@ -417,10 +434,6 @@ class WebAppActivity : AppCompatActivity() {
                     progressBar.visibility = View.GONE
                     errorView.visibility   = View.VISIBLE
                     errorText.text         = "Error: ${err.description}"
-                    // Reveal the toolbar so the user has a back/home
-                    // control — the web app failed to load so there is
-                    // no in-app navigation to rely on.
-                    appBar.visibility      = View.VISIBLE
                 }
             }
             override fun shouldOverrideUrlLoading(
@@ -436,17 +449,6 @@ class WebAppActivity : AppCompatActivity() {
                 return true
             }
 
-            /**
-             * Transparent caching proxy.
-             *
-             * Strategy for large files (models, WASM etc):
-             *   - Download fully to disk first in a background thread
-             *   - Only THEN stream to WebView from disk
-             *   - This avoids the PipedStream overflow that caused
-             *     "Failed to fetch" on large files
-             *
-             * For cached files: stream directly from disk instantly.
-             */
             override fun shouldInterceptRequest(
                 view: WebView,
                 request: WebResourceRequest
@@ -458,13 +460,11 @@ class WebAppActivity : AppCompatActivity() {
 
                 val cacheFile = urlToCacheFile(url)
 
-                // ── Cache hit: stream from disk immediately ───────────
                 if (cacheFile.exists() && cacheFile.length() > 0) {
                     android.util.Log.d("NetCache", "HIT  ${cacheFile.name}")
                     return streamFromDisk(cacheFile, url)
                 }
 
-                // ── Cache miss: download fully to disk, then serve ────
                 return try {
                     android.util.Log.d("NetCache", "MISS ${url.takeLast(60)}")
 
@@ -486,8 +486,7 @@ class WebAppActivity : AppCompatActivity() {
                     val tmpFile = File(cacheFile.parent, "${cacheFile.name}.tmp")
                     tmpFile.delete()
 
-                    // Download completely to disk first — no pipe needed
-                    val buf = ByteArray(512 * 1024) // 512KB buffer
+                    val buf = ByteArray(512 * 1024)
                     try {
                         FileOutputStream(tmpFile).use { fos ->
                             val net = conn.inputStream
@@ -508,7 +507,6 @@ class WebAppActivity : AppCompatActivity() {
                         conn.disconnect()
                     }
 
-                    // Now serve from disk — file is fully written
                     if (cacheFile.exists() && cacheFile.length() > 0) {
                         streamFromDisk(cacheFile, url)
                     } else null
@@ -524,9 +522,6 @@ class WebAppActivity : AppCompatActivity() {
             override fun onProgressChanged(v: WebView, p: Int) {
                 progressBar.progress = p
                 if (p == 100) progressBar.visibility = View.GONE
-            }
-            override fun onReceivedTitle(v: WebView, t: String) {
-                supportActionBar?.title = t
             }
             override fun onConsoleMessage(m: ConsoleMessage): Boolean {
                 android.util.Log.d("WebApp-JS",
@@ -661,16 +656,9 @@ class WebAppActivity : AppCompatActivity() {
 
     // ── Cache helpers ─────────────────────────────────────────────────────────
 
-    /**
-     * Stream a fully-downloaded file from disk to WebView.
-     * Uses a 512KB buffer — constant RAM, any file size.
-     */
     private fun streamFromDisk(file: File, url: String): WebResourceResponse {
         return WebResourceResponse(
-            guessMime(url),
-            null,
-            200,
-            "OK",
+            guessMime(url), null, 200, "OK",
             mapOf(
                 "Access-Control-Allow-Origin" to "*",
                 "Content-Length"              to file.length().toString(),
@@ -682,10 +670,10 @@ class WebAppActivity : AppCompatActivity() {
 
     private fun openConnection(url: String, request: WebResourceRequest): HttpURLConnection {
         return (URL(url).openConnection() as HttpURLConnection).apply {
-            requestMethod        = "GET"
+            requestMethod           = "GET"
             instanceFollowRedirects = true
-            connectTimeout       = 30_000
-            readTimeout          = 120_000  // 2 min for large files
+            connectTimeout          = 30_000
+            readTimeout             = 120_000
             request.requestHeaders?.forEach { (k, v) ->
                 if (!k.equals("Range", ignoreCase = true)) setRequestProperty(k, v)
             }
@@ -740,9 +728,6 @@ class WebAppActivity : AppCompatActivity() {
             webView.goBack(); return true
         }
         return super.onKeyDown(keyCode, event)
-    }
-    override fun onSupportNavigateUp(): Boolean {
-        onBackPressedDispatcher.onBackPressed(); return true
     }
     override fun onDestroy() {
         super.onDestroy(); server?.stop(); webView.destroy()
@@ -823,7 +808,7 @@ class SimpleServer(
     }
 
     private fun serveDocFile(out: OutputStream, file: DocumentFile) {
-        val bytes  = resolver.openInputStream(file.uri)?.use { it.readBytes() }
+        val bytes = resolver.openInputStream(file.uri)?.use { it.readBytes() }
             ?: run { send404(out); return }
         val mime   = getMime(file.name ?: "")
         val header = "HTTP/1.1 200 OK\r\nContent-Type: $mime\r\n" +
