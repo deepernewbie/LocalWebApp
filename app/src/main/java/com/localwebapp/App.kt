@@ -18,6 +18,9 @@ import android.widget.Toast
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AlertDialog
 import androidx.appcompat.app.AppCompatActivity
+import androidx.core.content.pm.ShortcutInfoCompat
+import androidx.core.content.pm.ShortcutManagerCompat
+import androidx.core.graphics.drawable.IconCompat
 import androidx.documentfile.provider.DocumentFile
 import androidx.recyclerview.widget.LinearLayoutManager
 import androidx.recyclerview.widget.RecyclerView
@@ -42,13 +45,15 @@ data class RecentProject(val name: String, val uri: String, val lastOpened: Long
 class RecentProjectsAdapter(
     private var projects: MutableList<RecentProject>,
     private val onOpen: (RecentProject) -> Unit,
-    private val onDelete: (RecentProject) -> Unit
+    private val onDelete: (RecentProject) -> Unit,
+    private val onShortcut: (RecentProject) -> Unit
 ) : RecyclerView.Adapter<RecentProjectsAdapter.ViewHolder>() {
 
     inner class ViewHolder(view: View) : RecyclerView.ViewHolder(view) {
         val name: TextView = view.findViewById(R.id.projectName)
         val date: TextView = view.findViewById(R.id.projectDate)
         val deleteBtn: View = view.findViewById(R.id.deleteButton)
+        val shortcutBtn: View = view.findViewById(R.id.shortcutButton)
     }
 
     override fun onCreateViewHolder(parent: ViewGroup, viewType: Int): ViewHolder {
@@ -64,6 +69,7 @@ class RecentProjectsAdapter(
         holder.date.text = "Last opened: ${sdf.format(Date(project.lastOpened))}"
         holder.itemView.setOnClickListener { onOpen(project) }
         holder.deleteBtn.setOnClickListener { onDelete(project) }
+        holder.shortcutBtn.setOnClickListener { onShortcut(project) }
     }
 
     override fun getItemCount() = projects.size
@@ -123,7 +129,8 @@ class MainActivity : AppCompatActivity() {
                     .setPositiveButton("Remove") { _, _ -> removeProject(it.uri) }
                     .setNegativeButton("Cancel", null)
                     .show()
-            }
+            },
+            onShortcut = { pinShortcut(it) }
         )
         recyclerView.layoutManager = LinearLayoutManager(this)
         recyclerView.adapter = adapter
@@ -131,6 +138,78 @@ class MainActivity : AppCompatActivity() {
             openFolderLauncher.launch(null)
         }
         loadProjects()
+
+        // If this instance was launched from a homescreen shortcut, jump
+        // straight to the web app without showing the picker.
+        handleShortcutIntent(intent)
+    }
+
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        setIntent(intent)
+        handleShortcutIntent(intent)
+    }
+
+    /**
+     * Shortcuts launch MainActivity with EXTRA_SHORTCUT_URI / NAME set.
+     * We forward immediately to WebAppActivity and finish ourselves so
+     * pressing back from the web app exits cleanly instead of landing
+     * on the project list.
+     */
+    private fun handleShortcutIntent(intent: Intent?) {
+        val uri  = intent?.getStringExtra(EXTRA_SHORTCUT_URI) ?: return
+        val name = intent.getStringExtra(EXTRA_SHORTCUT_NAME) ?: "Web App"
+        // Clear so rotation / re-resume doesn't re-forward.
+        intent.removeExtra(EXTRA_SHORTCUT_URI)
+        intent.removeExtra(EXTRA_SHORTCUT_NAME)
+        launchWebApp(Uri.parse(uri), name)
+        finish()
+    }
+
+    /**
+     * Request the launcher to pin a shortcut for this web app. Tapping
+     * the shortcut fires an Intent back into MainActivity with the URI
+     * extras, which we intercept above.
+     *
+     * Requires a launcher that supports pin shortcuts (most modern ones
+     * do). On unsupported launchers we fall back to a toast explaining
+     * the limitation.
+     */
+    private fun pinShortcut(p: RecentProject) {
+        if (!ShortcutManagerCompat.isRequestPinShortcutSupported(this)) {
+            Toast.makeText(
+                this,
+                "Your launcher doesn't support pinning shortcuts.",
+                Toast.LENGTH_LONG
+            ).show()
+            return
+        }
+        val launchIntent = Intent(this, MainActivity::class.java).apply {
+            action = Intent.ACTION_VIEW
+            addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TASK)
+            putExtra(EXTRA_SHORTCUT_URI, p.uri)
+            putExtra(EXTRA_SHORTCUT_NAME, p.name)
+        }
+        // Stable id per URI so re-pinning updates the same entry.
+        val id = "webapp_" + (p.uri.hashCode().toLong() and 0xFFFFFFFFL).toString(16)
+        val shortcut = ShortcutInfoCompat.Builder(this, id)
+            .setShortLabel(p.name.take(10))
+            .setLongLabel(p.name.take(25))
+            .setIcon(IconCompat.createWithResource(this, R.mipmap.ic_launcher))
+            .setIntent(launchIntent)
+            .build()
+        val ok = ShortcutManagerCompat.requestPinShortcut(this, shortcut, null)
+        Toast.makeText(
+            this,
+            if (ok) "Shortcut requested — confirm in launcher"
+            else    "Could not request shortcut",
+            Toast.LENGTH_SHORT
+        ).show()
+    }
+
+    companion object {
+        const val EXTRA_SHORTCUT_URI  = "shortcut_uri"
+        const val EXTRA_SHORTCUT_NAME = "shortcut_name"
     }
 
     override fun onResume() { super.onResume(); loadProjects() }
@@ -198,6 +277,7 @@ class WebAppActivity : AppCompatActivity() {
     private lateinit var progressBar: ProgressBar
     private lateinit var errorView: View
     private lateinit var errorText: TextView
+    private lateinit var appBar: View
     private var server: SimpleServer? = null
     private var pendingPermissionRequest: PermissionRequest? = null
     private var filePathCallback: ValueCallback<Array<Uri>>? = null
@@ -244,6 +324,11 @@ class WebAppActivity : AppCompatActivity() {
         val title  = intent.getStringExtra(EXTRA_TITLE) ?: "Web App"
         val folderUri = Uri.parse(uriStr)
 
+        // The AppBar (toolbar + progress bar) is hidden by default in
+        // the layout so the web app can use its full screen with its
+        // own header/theme. We still call setSupportActionBar so
+        // back-button handling works, and we reveal the bar on error.
+        appBar = findViewById(R.id.appBar)
         setSupportActionBar(findViewById(R.id.toolbar))
         supportActionBar?.apply {
             this.title = title
@@ -332,6 +417,10 @@ class WebAppActivity : AppCompatActivity() {
                     progressBar.visibility = View.GONE
                     errorView.visibility   = View.VISIBLE
                     errorText.text         = "Error: ${err.description}"
+                    // Reveal the toolbar so the user has a back/home
+                    // control — the web app failed to load so there is
+                    // no in-app navigation to rely on.
+                    appBar.visibility      = View.VISIBLE
                 }
             }
             override fun shouldOverrideUrlLoading(
