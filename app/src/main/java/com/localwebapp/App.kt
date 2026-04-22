@@ -75,8 +75,8 @@ class RecentProjectsAdapter(
         holder.name.text = project.name
         val sdf = SimpleDateFormat("MMM dd, yyyy HH:mm", Locale.getDefault())
         holder.date.text = "Last opened: ${sdf.format(Date(project.lastOpened))}"
-        holder.itemView.setOnClickListener  { onOpen(project) }
-        holder.deleteBtn.setOnClickListener { onDelete(project) }
+        holder.itemView.setOnClickListener   { onOpen(project) }
+        holder.deleteBtn.setOnClickListener  { onDelete(project) }
         holder.shortcutBtn.setOnClickListener { onShortcut(project) }
     }
 
@@ -125,17 +125,44 @@ class MainActivity : AppCompatActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
 
+        // ══════════════════════════════════════════════════════════════════
         // Handle launch from home screen shortcut
+        // CRITICAL: we must NOT touch any views here since setContentView
+        // hasn't been called yet. Only update prefs then launch.
+        // ══════════════════════════════════════════════════════════════════
         if (intent?.action == "com.localwebapp.OPEN_SHORTCUT") {
             val uri   = intent.getStringExtra("uri")
             val title = intent.getStringExtra("title") ?: "Web App"
             if (uri != null) {
-                launchWebApp(Uri.parse(uri), title)
+                // Update "last opened" timestamp without touching views
+                try {
+                    val arr = loadJson()
+                    val filtered = (0 until arr.length())
+                        .map { arr.getJSONObject(it) }
+                        .filter { it.getString("uri") != uri }.toMutableList()
+                    filtered.add(0, JSONObject().apply {
+                        put("name", title); put("uri", uri)
+                        put("lastOpened", System.currentTimeMillis())
+                    })
+                    val out = JSONArray()
+                    filtered.take(20).forEach { out.put(it) }
+                    prefs.edit().putString("projects", out.toString()).apply()
+                } catch (e: Exception) {
+                    // Non-fatal — still launch
+                }
+
+                // Launch WebAppActivity directly, skip the picker UI
+                val launchIntent = Intent(this, WebAppActivity::class.java).apply {
+                    putExtra(WebAppActivity.EXTRA_URI, uri)
+                    putExtra(WebAppActivity.EXTRA_TITLE, title)
+                }
+                startActivity(launchIntent)
                 finish()
                 return
             }
         }
 
+        // Normal launch — show project picker
         setContentView(R.layout.activity_main)
         setSupportActionBar(findViewById(R.id.toolbar))
         recyclerView = findViewById(R.id.recyclerView)
@@ -162,7 +189,7 @@ class MainActivity : AppCompatActivity() {
         loadProjects()
     }
 
-    override fun onResume() { super.onResume(); loadProjects() }
+    override fun onResume() { super.onResume(); if (::adapter.isInitialized) loadProjects() }
 
     private fun launchWebApp(uri: Uri, name: String) {
         saveProject(name, uri.toString())
@@ -191,7 +218,6 @@ class MainActivity : AppCompatActivity() {
             addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TASK)
         }
 
-        // Generate a simple colored-letter icon from the first letter of the app name
         val iconBitmap = makeLetterIcon(project.name.firstOrNull()?.uppercase() ?: "W")
 
         val shortcut = ShortcutInfoCompat.Builder(this, "webapp_${project.uri.hashCode()}")
@@ -234,9 +260,9 @@ class MainActivity : AppCompatActivity() {
         canvas.drawRoundRect(0f, 0f, size.toFloat(), size.toFloat(), 40f, 40f, bgPaint)
 
         val textPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-            this.color  = Color.WHITE
-            textSize    = 110f
-            textAlign   = Paint.Align.CENTER
+            this.color     = Color.WHITE
+            textSize       = 110f
+            textAlign      = Paint.Align.CENTER
             isFakeBoldText = true
         }
         val yOffset = (textPaint.descent() + textPaint.ascent()) / 2
@@ -257,7 +283,7 @@ class MainActivity : AppCompatActivity() {
         val out = JSONArray()
         filtered.take(20).forEach { out.put(it) }
         prefs.edit().putString("projects", out.toString()).apply()
-        loadProjects()
+        if (::adapter.isInitialized) loadProjects()
     }
 
     private fun removeProject(uriStr: String) {
@@ -268,7 +294,7 @@ class MainActivity : AppCompatActivity() {
         val out = JSONArray()
         filtered.forEach { out.put(it) }
         prefs.edit().putString("projects", out.toString()).apply()
-        loadProjects()
+        if (::adapter.isInitialized) loadProjects()
     }
 
     private fun loadJson(): JSONArray {
@@ -283,8 +309,8 @@ class MainActivity : AppCompatActivity() {
             RecentProject(o.getString("name"), o.getString("uri"), o.getLong("lastOpened"))
         }
         adapter.updateProjects(list)
-        emptyView.visibility     = if (list.isEmpty()) View.VISIBLE else View.GONE
-        recyclerView.visibility  = if (list.isEmpty()) View.GONE    else View.VISIBLE
+        emptyView.visibility    = if (list.isEmpty()) View.VISIBLE else View.GONE
+        recyclerView.visibility = if (list.isEmpty()) View.GONE    else View.VISIBLE
     }
 }
 
@@ -341,9 +367,7 @@ class WebAppActivity : AppCompatActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
 
-        // ── Full-screen: web app owns the whole screen ──
-        // Hide system action bar, go edge-to-edge, let the web app
-        // paint under the status bar if it wants to.
+        // Hide action bar — web app owns the full screen
         supportActionBar?.hide()
 
         setContentView(R.layout.activity_webapp)
@@ -352,10 +376,10 @@ class WebAppActivity : AppCompatActivity() {
         val title     = intent.getStringExtra(EXTRA_TITLE) ?: "Web App"
         val folderUri = Uri.parse(uriStr)
 
-        webView      = findViewById(R.id.webView)
-        progressBar  = findViewById(R.id.progressBar)
-        errorView    = findViewById(R.id.errorView)
-        errorText    = findViewById(R.id.errorText)
+        webView     = findViewById(R.id.webView)
+        progressBar = findViewById(R.id.progressBar)
+        errorView   = findViewById(R.id.errorView)
+        errorText   = findViewById(R.id.errorText)
 
         val s = SimpleServer(contentResolver, folderUri, filesDir)
         server = s
