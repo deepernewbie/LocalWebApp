@@ -277,7 +277,7 @@ class MainActivity : AppCompatActivity() {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// NativeAudioRecorder — unchanged from previous version
+// NativeAudioRecorder — AudioRecord-based, WAV output, waveform, pause/resume
 // ═══════════════════════════════════════════════════════════════════════════════
 class NativeAudioRecorder {
     companion object {
@@ -345,8 +345,8 @@ class NativeAudioRecorder {
         }
     }
 
-    fun pause():  String { if (!isRecording) return "error:not recording"; isPaused = true;  return "ok" }
-    fun resume(): String { if (!isRecording) return "error:not recording"; isPaused = false; return "ok" }
+    fun pauseRecording():  String { if (!isRecording) return "error:not recording"; isPaused = true;  return "ok" }
+    fun resumeRecording(): String { if (!isRecording) return "error:not recording"; isPaused = false; return "ok" }
 
     fun stop(): String {
         if (!isRecording) return "error:not recording"
@@ -421,6 +421,143 @@ class NativeAudioRecorder {
     }
 }
 
+// ═══════════════════════════════════════════════════════════════════════════════
+// JsFilesystemBridge — class-level bridge with no name collisions.
+// ═══════════════════════════════════════════════════════════════════════════════
+class JsFilesystemBridge(
+    private val ctx: android.content.Context,
+    private val resolver: ContentResolver,
+    private val rootUri: Uri
+) {
+    /** Walk/create segments relative to the root SAF folder. */
+    private fun resolvePath(path: String, createFile: Boolean): DocumentFile? {
+        val root = DocumentFile.fromTreeUri(ctx, rootUri) ?: return null
+        val segments = path.split("/", "\\")
+            .filter { it.isNotEmpty() && it != ".." && it != "." }
+        if (segments.isEmpty()) return null
+        var node: DocumentFile = root
+        for (i in 0 until segments.size - 1) {
+            val name = segments[i]
+            val child = node.findFile(name)
+            node = if (child != null && child.isDirectory) child
+                   else if (createFile) node.createDirectory(name) ?: return null
+                   else return null
+        }
+        val leaf = segments.last()
+        val existing = node.findFile(leaf)
+        if (existing != null) return existing
+        if (createFile) return node.createFile("application/octet-stream", leaf)
+        return null
+    }
+
+    @JavascriptInterface
+    fun read(path: String): String? {
+        return try {
+            val file = resolvePath(path, false) ?: return null
+            if (!file.isFile) return null
+            resolver.openInputStream(file.uri)?.use { it.readBytes() }
+                ?.toString(Charsets.UTF_8)
+        } catch (e: Exception) {
+            android.util.Log.e("LWA-FS", "read $path: ${e.message}")
+            null
+        }
+    }
+
+    @JavascriptInterface
+    fun write(path: String, content: String): String {
+        return try {
+            val file = resolvePath(path, true) ?: return "error:path"
+            // Truncate: delete + recreate to avoid leftover bytes when new
+            // content is shorter than old. Use "wt" for truncation if available.
+            val bytes = content.toByteArray(Charsets.UTF_8)
+            resolver.openOutputStream(file.uri, "wt")?.use { it.write(bytes) }
+                ?: return "error:no output stream"
+            "ok"
+        } catch (e: Exception) {
+            android.util.Log.e("LWA-FS", "write $path: ${e.message}")
+            "error:${e.message}"
+        }
+    }
+
+    @JavascriptInterface
+    fun readBase64(path: String): String? {
+        return try {
+            val file = resolvePath(path, false) ?: return null
+            if (!file.isFile) return null
+            val bytes = resolver.openInputStream(file.uri)?.use { it.readBytes() } ?: return null
+            Base64.encodeToString(bytes, Base64.NO_WRAP)
+        } catch (e: Exception) {
+            android.util.Log.e("LWA-FS", "readBase64 $path: ${e.message}")
+            null
+        }
+    }
+
+    @JavascriptInterface
+    fun writeBase64(path: String, b64: String): String {
+        return try {
+            val file = resolvePath(path, true) ?: return "error:path"
+            val bytes = Base64.decode(b64, Base64.DEFAULT)
+            resolver.openOutputStream(file.uri, "wt")?.use { it.write(bytes) }
+                ?: return "error:no output stream"
+            "ok"
+        } catch (e: Exception) {
+            "error:${e.message}"
+        }
+    }
+
+    @JavascriptInterface
+    fun deleteFile(path: String): String {
+        return try {
+            val file = resolvePath(path, false) ?: return "error:not found"
+            if (file.delete()) "ok" else "error:delete failed"
+        } catch (e: Exception) {
+            "error:${e.message}"
+        }
+    }
+
+    @JavascriptInterface
+    fun list(path: String): String {
+        return try {
+            val node = if (path.isEmpty() || path == "/" || path == ".") {
+                DocumentFile.fromTreeUri(ctx, rootUri)
+            } else {
+                val root = DocumentFile.fromTreeUri(ctx, rootUri) ?: return ""
+                val segments = path.split("/", "\\")
+                    .filter { it.isNotEmpty() && it != ".." && it != "." }
+                var n: DocumentFile = root
+                for (seg in segments) { n = n.findFile(seg) ?: return ""; if (!n.isDirectory) return "" }
+                n
+            } ?: return ""
+            node.listFiles().mapNotNull { it.name }.joinToString("\n")
+        } catch (e: Exception) { "" }
+    }
+
+    @JavascriptInterface
+    fun exists(path: String): Boolean {
+        return try {
+            val file = resolvePath(path, false)
+            file != null && file.exists()
+        } catch (e: Exception) { false }
+    }
+
+    @JavascriptInterface
+    fun mkdir(path: String): String {
+        return try {
+            val root = DocumentFile.fromTreeUri(ctx, rootUri) ?: return "error:root"
+            val segments = path.split("/", "\\")
+                .filter { it.isNotEmpty() && it != ".." && it != "." }
+            if (segments.isEmpty()) return "error:empty path"
+            var node: DocumentFile = root
+            for (name in segments) {
+                val child = node.findFile(name)
+                node = if (child != null && child.isDirectory) child
+                       else node.createDirectory(name) ?: return "error:mkdir $name"
+            }
+            "ok"
+        } catch (e: Exception) { "error:${e.message}" }
+    }
+}
+
 class WebAppActivity : AppCompatActivity() {
 
     companion object {
@@ -431,8 +568,8 @@ class WebAppActivity : AppCompatActivity() {
         private const val AUDIO_SHIM_JS = """
 (function(){
   if (typeof Android === 'undefined' || typeof Android.recStart !== 'function') return;
-  if (window.__lwa_shim_v2) return;
-  window.__lwa_shim_v2 = true;
+  if (window.__lwa_audio_v1) return;
+  window.__lwa_audio_v1 = true;
 
   var origGUM = navigator.mediaDevices && navigator.mediaDevices.getUserMedia
                 ? navigator.mediaDevices.getUserMedia.bind(navigator.mediaDevices) : null;
@@ -441,9 +578,9 @@ class WebAppActivity : AppCompatActivity() {
 
   function makeTrack() {
     return {
-      kind: 'audio', id: 'lwa-track-' + Math.random().toString(36).slice(2),
-      label: 'Native Android Microphone',
-      enabled: true, muted: false, readyState: 'live', contentHint: '',
+      kind:'audio', id:'lwa-track-'+Math.random().toString(36).slice(2),
+      label:'Native Android Microphone',
+      enabled:true, muted:false, readyState:'live', contentHint:'',
       stop: function(){ this.readyState='ended'; this.enabled=false; },
       getSettings: function(){ return {sampleRate:44100, channelCount:1, deviceId:'native'}; },
       getCapabilities: function(){ return {}; }, getConstraints: function(){ return {}; },
@@ -499,21 +636,21 @@ class WebAppActivity : AppCompatActivity() {
       ['dataavailable','start','stop','pause','resume','error'].forEach(function(ev){
         self._real.addEventListener(ev, function(e){ self._fire(ev, e); });
       });
-      Object.defineProperty(this, 'state',    { get: function(){ return self._real.state; }});
-      Object.defineProperty(this, 'mimeType', { get: function(){ return self._real.mimeType; }});
+      Object.defineProperty(this, 'state',    { get:function(){ return self._real.state; }});
+      Object.defineProperty(this, 'mimeType', { get:function(){ return self._real.mimeType; }});
       this.stream = stream; return;
     }
-    this._state = 'inactive'; this.stream = stream; this.mimeType = 'audio/wav';
-    this.audioBitsPerSecond = 705600; this.videoBitsPerSecond = 0;
+    this._state='inactive'; this.stream=stream; this.mimeType='audio/wav';
+    this.audioBitsPerSecond=705600; this.videoBitsPerSecond=0;
     var self = this;
-    Object.defineProperty(this, 'state', { get: function(){ return self._state; }});
+    Object.defineProperty(this, 'state', { get:function(){ return self._state; }});
   }
   NativeMR.prototype._fire = function(ev, detail) {
     var handlers = (this._handlers[ev] || []).slice();
-    var evt; try { evt = new Event(ev); } catch(e) { evt = { type: ev }; }
+    var evt; try { evt = new Event(ev); } catch(e) { evt = {type:ev}; }
     if (detail) for (var k in detail) try { evt[k] = detail[k]; } catch(_) {}
     handlers.forEach(function(h){ try { h(evt); } catch(e) { console.error(e); } });
-    var cb = this['on' + ev];
+    var cb = this['on'+ev];
     if (typeof cb === 'function') try { cb(evt); } catch(e) { console.error(e); }
   };
   NativeMR.prototype.addEventListener = function(ev, fn) {
@@ -530,7 +667,7 @@ class WebAppActivity : AppCompatActivity() {
     var r = Android.recStart();
     if (r !== 'ok') {
       var err = new Error(r); err.name = 'NotReadableError';
-      this._fire('error', { error: err }); return;
+      this._fire('error', { error:err }); return;
     }
     this._state = 'recording'; this._fire('start');
   };
@@ -544,12 +681,12 @@ class WebAppActivity : AppCompatActivity() {
       var bin = atob(b64);
       var buf = new Uint8Array(bin.length);
       for (var i = 0; i < bin.length; i++) buf[i] = bin.charCodeAt(i);
-      var blob = new Blob([buf], { type: 'audio/wav' });
-      this._fire('dataavailable', { data: blob });
+      var blob = new Blob([buf], { type:'audio/wav' });
+      this._fire('dataavailable', { data:blob });
       this._fire('stop');
     } else {
       var e = new Error(dataUrl || 'recStop failed'); e.name = 'AbortError';
-      this._fire('error', { error: e }); this._fire('stop');
+      this._fire('error', { error:e }); this._fire('stop');
     }
   };
   NativeMR.prototype.pause = function() {
@@ -643,62 +780,49 @@ class WebAppActivity : AppCompatActivity() {
 """
 
         /**
-         * File-system shim: makes `fetch('./path', {method:'PUT', body})` work
-         * so web apps can transparently write files into the SAF folder on disk.
-         * Also patches GET for files to bypass the HTTP server's port-change
-         * origin issue (same-path reads work). PUT/POST writes via HTTP to
-         * same origin; DELETE removes a file.
+         * FS shim. Uses AndroidFS_native (class-level bridge with real
+         * @JavascriptInterface methods) under the hood. Exposes:
          *
-         * Web apps just use standard fetch() — nothing to learn.
+         *   window.AndroidFS.read(path)           → Promise<string|null>
+         *   window.AndroidFS.write(path, str)     → Promise<boolean>
+         *   window.AndroidFS.readBytes(path)      → Promise<Uint8Array|null>
+         *   window.AndroidFS.writeBytes(path, u8) → Promise<boolean>
+         *   window.AndroidFS.delete(path)         → Promise<boolean>
+         *   window.AndroidFS.list(path)           → Promise<string[]>
+         *   window.AndroidFS.exists(path)         → Promise<boolean>
+         *   window.AndroidFS.mkdir(path)          → Promise<boolean>
          *
-         * Also exposes window.AndroidFS for apps that want a more direct API:
-         *   await AndroidFS.read('notes/notes.json')     → string or null
-         *   await AndroidFS.write('notes/notes.json', s) → true/false
-         *   await AndroidFS.delete('notes/notes.json')   → true/false
-         *   await AndroidFS.list('notes')                → string[]
-         *   await AndroidFS.exists('notes/notes.json')   → boolean
+         * Also patches fetch() so standard PUT/DELETE to same-origin URLs
+         * transparently write/delete files in the SAF folder on disk.
          */
         private const val FS_SHIM_JS = """
 (function(){
-  if (typeof Android === 'undefined' || typeof Android.fsWrite !== 'function') return;
-  if (window.__lwa_fs_shim_v1) return;
-  window.__lwa_fs_shim_v1 = true;
+  var B = window.AndroidFS_native;
+  if (!B || typeof B.read !== 'function') {
+    console.warn('[LWA] AndroidFS_native bridge missing — fs shim inactive');
+    return;
+  }
+  if (window.__lwa_fs_v2) return;
+  window.__lwa_fs_v2 = true;
 
   window.AndroidFS = {
     read: function(path) {
-      return new Promise(function(res) {
-        try {
-          var r = Android.fsRead(path);
-          if (r === null || r === undefined) return res(null);
-          res(r);
-        } catch(e) { res(null); }
+      return new Promise(function(res){
+        try { res(B.read(String(path))); } catch(e) { res(null); }
       });
     },
     write: function(path, content) {
-      return new Promise(function(res) {
+      return new Promise(function(res){
         try {
           var s = (typeof content === 'string') ? content : JSON.stringify(content);
-          res(Android.fsWrite(path, s) === 'ok');
-        } catch(e) { res(false); }
-      });
-    },
-    writeBytes: function(path, uint8array) {
-      return new Promise(function(res) {
-        try {
-          var b64 = '';
-          var chunks = [];
-          for (var i = 0; i < uint8array.length; i += 0x8000) {
-            chunks.push(String.fromCharCode.apply(null, uint8array.subarray(i, i + 0x8000)));
-          }
-          b64 = btoa(chunks.join(''));
-          res(Android.fsWriteBase64(path, b64) === 'ok');
+          res(B.write(String(path), s) === 'ok');
         } catch(e) { res(false); }
       });
     },
     readBytes: function(path) {
-      return new Promise(function(res) {
+      return new Promise(function(res){
         try {
-          var b64 = Android.fsReadBase64(path);
+          var b64 = B.readBase64(String(path));
           if (!b64) return res(null);
           var bin = atob(b64);
           var arr = new Uint8Array(bin.length);
@@ -707,50 +831,57 @@ class WebAppActivity : AppCompatActivity() {
         } catch(e) { res(null); }
       });
     },
+    writeBytes: function(path, uint8array) {
+      return new Promise(function(res){
+        try {
+          var chunks = [];
+          for (var i = 0; i < uint8array.length; i += 0x8000) {
+            chunks.push(String.fromCharCode.apply(null, uint8array.subarray(i, i + 0x8000)));
+          }
+          var b64 = btoa(chunks.join(''));
+          res(B.writeBase64(String(path), b64) === 'ok');
+        } catch(e) { res(false); }
+      });
+    },
     delete: function(path) {
-      return new Promise(function(res) {
-        try { res(Android.fsDelete(path) === 'ok'); }
-        catch(e) { res(false); }
+      return new Promise(function(res){
+        try { res(B.deleteFile(String(path)) === 'ok'); } catch(e) { res(false); }
       });
     },
     list: function(path) {
-      return new Promise(function(res) {
+      return new Promise(function(res){
         try {
-          var s = Android.fsList(path || '');
+          var s = B.list(path ? String(path) : '');
           res(s ? s.split('\n').filter(function(x){ return x.length > 0; }) : []);
         } catch(e) { res([]); }
       });
     },
     exists: function(path) {
-      return new Promise(function(res) {
-        try { res(Android.fsExists(path)); }
-        catch(e) { res(false); }
+      return new Promise(function(res){
+        try { res(!!B.exists(String(path))); } catch(e) { res(false); }
       });
     },
     mkdir: function(path) {
-      return new Promise(function(res) {
-        try { res(Android.fsMkdir(path) === 'ok'); }
-        catch(e) { res(false); }
+      return new Promise(function(res){
+        try { res(B.mkdir(String(path)) === 'ok'); } catch(e) { res(false); }
       });
     }
   };
 
-  // Also patch fetch() so PUT/DELETE/POST requests to the app's own origin
-  // write/delete files in the SAF folder. This makes standard web code work:
-  //     fetch('./notes.json', {method:'PUT', body: JSON.stringify(data)});
+  // Patch fetch() so PUT/DELETE/POST to same-origin URLs persist to disk.
   var origFetch = window.fetch ? window.fetch.bind(window) : null;
   window.fetch = function(input, init) {
     var url = (typeof input === 'string') ? input : (input && input.url);
     var method = (init && init.method ? init.method : 'GET').toUpperCase();
 
-    // Same-origin writes → route to native FS
     if (url && method !== 'GET' && method !== 'HEAD') {
       var u; try { u = new URL(url, location.href); } catch(e) { u = null; }
       if (u && u.origin === location.origin) {
         var path = decodeURIComponent(u.pathname.replace(/^\//, ''));
+
         if (method === 'PUT' || method === 'POST') {
           var body = init && init.body;
-          return new Promise(function(resolve) {
+          return new Promise(function(resolve){
             var done = function(ok) {
               resolve(new Response(ok ? 'ok' : 'fail', {
                 status: ok ? 200 : 500,
@@ -759,8 +890,7 @@ class WebAppActivity : AppCompatActivity() {
             };
             if (body instanceof Blob) {
               body.arrayBuffer().then(function(ab){
-                var u8 = new Uint8Array(ab);
-                window.AndroidFS.writeBytes(path, u8).then(done);
+                window.AndroidFS.writeBytes(path, new Uint8Array(ab)).then(done);
               });
             } else if (body instanceof ArrayBuffer) {
               window.AndroidFS.writeBytes(path, new Uint8Array(body)).then(done);
@@ -769,14 +899,13 @@ class WebAppActivity : AppCompatActivity() {
             } else if (body == null) {
               window.AndroidFS.write(path, '').then(done);
             } else {
-              try {
-                window.AndroidFS.write(path, JSON.stringify(body)).then(done);
-              } catch(e) { done(false); }
+              try { window.AndroidFS.write(path, JSON.stringify(body)).then(done); }
+              catch(e) { done(false); }
             }
           });
         }
         if (method === 'DELETE') {
-          return window.AndroidFS.delete(path).then(function(ok) {
+          return window.AndroidFS.delete(path).then(function(ok){
             return new Response(ok ? 'ok' : 'fail', { status: ok ? 200 : 500 });
           });
         }
@@ -786,7 +915,7 @@ class WebAppActivity : AppCompatActivity() {
                      : Promise.reject(new Error('fetch unavailable'));
   };
 
-  console.log('[LWA] filesystem shim active — fetch() PUT/DELETE and AndroidFS.* ready');
+  console.log('[LWA] filesystem bridge active (AndroidFS, fetch PUT/DELETE)');
 })();
 """
     }
@@ -804,6 +933,7 @@ class WebAppActivity : AppCompatActivity() {
     private lateinit var appTitle: String
 
     private val nativeRecorder = NativeAudioRecorder()
+    private var fsBridge: JsFilesystemBridge? = null
 
     private val startupPermsLauncher =
         registerForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) { _ ->
@@ -843,135 +973,6 @@ class WebAppActivity : AppCompatActivity() {
 
     private val netCacheDir by lazy { File(filesDir, NET_CACHE).also { it.mkdirs() } }
 
-    // ═════════════════════════════════════════════════════════════════════════
-    // SAF filesystem helpers — lets the JS bridge read/write files in the
-    // user-picked folder so web apps have real persistent storage on disk.
-    // ═════════════════════════════════════════════════════════════════════════
-
-    /**
-     * Resolve a relative path like "notes/notes.json" against the root SAF
-     * folder. Returns null if any segment is missing when create=false, or
-     * auto-creates directories/file when create=true.
-     */
-    private fun resolveSafPath(path: String, createFile: Boolean): DocumentFile? {
-        val root = DocumentFile.fromTreeUri(this, folderUri) ?: return null
-        val segments = path.split("/", "\\")
-            .filter { it.isNotEmpty() && it != ".." && it != "." }
-        if (segments.isEmpty()) return null
-
-        var node: DocumentFile = root
-        for (i in 0 until segments.size - 1) {
-            val name = segments[i]
-            val child = node.findFile(name)
-            node = if (child != null && child.isDirectory) child
-                   else if (createFile) node.createDirectory(name) ?: return null
-                   else return null
-        }
-        val leaf = segments.last()
-        val existing = node.findFile(leaf)
-        if (existing != null) return existing
-        if (createFile) return node.createFile("application/octet-stream", leaf)
-        return null
-    }
-
-    private fun fsRead(path: String): String? {
-        return try {
-            val file = resolveSafPath(path, createFile = false) ?: return null
-            if (!file.isFile) return null
-            contentResolver.openInputStream(file.uri)?.use { it.readBytes() }
-                ?.toString(Charsets.UTF_8)
-        } catch (e: Exception) {
-            android.util.Log.e("LWA-FS", "read failed $path: ${e.message}")
-            null
-        }
-    }
-
-    private fun fsWrite(path: String, content: String): String {
-        return try {
-            val file = resolveSafPath(path, createFile = true) ?: return "error:path"
-            contentResolver.openOutputStream(file.uri, "wt")?.use {
-                it.write(content.toByteArray(Charsets.UTF_8))
-            } ?: return "error:no output stream"
-            "ok"
-        } catch (e: Exception) {
-            android.util.Log.e("LWA-FS", "write failed $path: ${e.message}")
-            "error:${e.message}"
-        }
-    }
-
-    private fun fsReadBase64(path: String): String? {
-        return try {
-            val file = resolveSafPath(path, createFile = false) ?: return null
-            if (!file.isFile) return null
-            val bytes = contentResolver.openInputStream(file.uri)?.use { it.readBytes() } ?: return null
-            Base64.encodeToString(bytes, Base64.NO_WRAP)
-        } catch (e: Exception) {
-            android.util.Log.e("LWA-FS", "readBytes failed $path: ${e.message}")
-            null
-        }
-    }
-
-    private fun fsWriteBase64(path: String, b64: String): String {
-        return try {
-            val file = resolveSafPath(path, createFile = true) ?: return "error:path"
-            val bytes = Base64.decode(b64, Base64.DEFAULT)
-            contentResolver.openOutputStream(file.uri, "wt")?.use { it.write(bytes) }
-                ?: return "error:no output stream"
-            "ok"
-        } catch (e: Exception) {
-            "error:${e.message}"
-        }
-    }
-
-    private fun fsDelete(path: String): String {
-        return try {
-            val file = resolveSafPath(path, createFile = false) ?: return "error:not found"
-            if (file.delete()) "ok" else "error:delete failed"
-        } catch (e: Exception) {
-            "error:${e.message}"
-        }
-    }
-
-    private fun fsList(path: String): String {
-        return try {
-            val node = if (path.isEmpty() || path == "/" || path == ".") {
-                DocumentFile.fromTreeUri(this, folderUri)
-            } else {
-                // Navigate into dir
-                val root = DocumentFile.fromTreeUri(this, folderUri) ?: return ""
-                val segments = path.split("/", "\\")
-                    .filter { it.isNotEmpty() && it != ".." && it != "." }
-                var n: DocumentFile = root
-                for (seg in segments) { n = n.findFile(seg) ?: return ""; if (!n.isDirectory) return "" }
-                n
-            } ?: return ""
-            node.listFiles().mapNotNull { it.name }.joinToString("\n")
-        } catch (e: Exception) { "" }
-    }
-
-    private fun fsExists(path: String): Boolean {
-        return try {
-            val file = resolveSafPath(path, createFile = false)
-            file != null && file.exists()
-        } catch (e: Exception) { false }
-    }
-
-    private fun fsMkdir(path: String): String {
-        return try {
-            val root = DocumentFile.fromTreeUri(this, folderUri) ?: return "error:root"
-            val segments = path.split("/", "\\")
-                .filter { it.isNotEmpty() && it != ".." && it != "." }
-            if (segments.isEmpty()) return "error:empty path"
-            var node: DocumentFile = root
-            for (name in segments) {
-                val child = node.findFile(name)
-                node = if (child != null && child.isDirectory) child
-                       else node.createDirectory(name) ?: return "error:mkdir $name"
-            }
-            "ok"
-        } catch (e: Exception) { "error:${e.message}" }
-    }
-
     @SuppressLint("SetJavaScriptEnabled")
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -1001,6 +1002,7 @@ class WebAppActivity : AppCompatActivity() {
     }
 
     private fun initializeWebApp() {
+        fsBridge = JsFilesystemBridge(this, contentResolver, folderUri)
         val s = SimpleServer(contentResolver, folderUri, filesDir)
         server = s; s.start()
         setupWebView()
@@ -1023,6 +1025,7 @@ class WebAppActivity : AppCompatActivity() {
             mixedContentMode = WebSettings.MIXED_CONTENT_COMPATIBILITY_MODE
         }
 
+        // Main Android bridge — general methods and audio recording
         webView.addJavascriptInterface(object : Any() {
             @JavascriptInterface fun toast(msg: String) = runOnUiThread {
                 Toast.makeText(this@WebAppActivity, msg, Toast.LENGTH_SHORT).show()
@@ -1051,26 +1054,22 @@ class WebAppActivity : AppCompatActivity() {
                 } catch (e: Exception) { "0" }
             }
 
-            // Native audio bridge (used by AUDIO_SHIM_JS)
-            @JavascriptInterface fun recStart():  String = nativeRecorder.start()
-            @JavascriptInterface fun recStop():   String = nativeRecorder.stop()
-            @JavascriptInterface fun recPause():  String = nativeRecorder.pause()
-            @JavascriptInterface fun recResume(): String = nativeRecorder.resume()
+            // Audio recording bridge (used by AUDIO_SHIM_JS; method names
+            // don't collide with anything else)
+            @JavascriptInterface fun recStart():  String  = nativeRecorder.start()
+            @JavascriptInterface fun recStop():   String  = nativeRecorder.stop()
+            @JavascriptInterface fun recPause():  String  = nativeRecorder.pauseRecording()
+            @JavascriptInterface fun recResume(): String  = nativeRecorder.resumeRecording()
             @JavascriptInterface fun recAmplitude(): Int  = nativeRecorder.getAmplitude()
             @JavascriptInterface fun recWaveform(count: Int): String = nativeRecorder.getWaveform(count)
-            @JavascriptInterface fun recIsActive():  Boolean = nativeRecorder.isActive()
-            @JavascriptInterface fun recIsPaused():  Boolean = nativeRecorder.isPausedState()
-
-            // Filesystem bridge (used by FS_SHIM_JS → AndroidFS.*)
-            @JavascriptInterface fun fsRead(path: String): String? = fsRead(path)
-            @JavascriptInterface fun fsWrite(path: String, content: String): String = fsWrite(path, content)
-            @JavascriptInterface fun fsReadBase64(path: String): String? = fsReadBase64(path)
-            @JavascriptInterface fun fsWriteBase64(path: String, b64: String): String = fsWriteBase64(path, b64)
-            @JavascriptInterface fun fsDelete(path: String): String = fsDelete(path)
-            @JavascriptInterface fun fsList(path: String): String = fsList(path)
-            @JavascriptInterface fun fsExists(path: String): Boolean = fsExists(path)
-            @JavascriptInterface fun fsMkdir(path: String): String = fsMkdir(path)
+            @JavascriptInterface fun recIsActive(): Boolean = nativeRecorder.isActive()
+            @JavascriptInterface fun recIsPaused(): Boolean = nativeRecorder.isPausedState()
         }, "Android")
+
+        // Filesystem bridge — separate class with real @JavascriptInterface methods.
+        // Exposed to JS as `AndroidFS_native`. The FS_SHIM_JS wraps this with
+        // Promise-returning methods as `window.AndroidFS`.
+        fsBridge?.let { webView.addJavascriptInterface(it, "AndroidFS_native") }
 
         webView.webViewClient = object : WebViewClient() {
             override fun onPageStarted(v: WebView, url: String, f: Bitmap?) {
