@@ -338,6 +338,37 @@ class WebAppActivity : AppCompatActivity() {
             pendingPermissionRequest = null
         }
 
+    /**
+     * Runtime permissions requested eagerly at activity start, *before*
+     * the WebView tries to use getUserMedia. Required on Android 6+ and
+     * especially aggressive on Samsung One UI — WebView's
+     * PermissionRequest.grant() silently fails when the underlying OS
+     * grant isn't already in place, producing a misleading
+     * NotReadableError: "Could not start audio source" with an empty
+     * MediaDeviceInfo.label.
+     */
+    private val startupPermissionLauncher =
+        registerForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) { _ ->
+            android.util.Log.d("WebApp", "Startup permissions result received")
+        }
+
+    private fun requestStartupPermissions() {
+        val needed = mutableListOf<String>()
+        val want = listOf(
+            android.Manifest.permission.RECORD_AUDIO,
+            android.Manifest.permission.CAMERA
+        )
+        for (p in want) {
+            if (checkSelfPermission(p) !=
+                android.content.pm.PackageManager.PERMISSION_GRANTED) {
+                needed.add(p)
+            }
+        }
+        if (needed.isNotEmpty()) {
+            startupPermissionLauncher.launch(needed.toTypedArray())
+        }
+    }
+
     private val fileChooserLauncher =
         registerForActivityResult(ActivityResultContracts.GetMultipleContents()) { uris ->
             filePathCallback?.onReceiveValue(uris.toTypedArray())
@@ -371,6 +402,12 @@ class WebAppActivity : AppCompatActivity() {
         supportActionBar?.hide()
 
         setContentView(R.layout.activity_webapp)
+
+        // Request runtime permissions BEFORE the WebView loads the page.
+        // Without this, Samsung WebView's getUserMedia returns an opaque
+        // NotReadableError because the OS mic grant doesn't exist yet
+        // when the page asks for it.
+        requestStartupPermissions()
 
         val uriStr    = intent.getStringExtra(EXTRA_URI) ?: run { finish(); return }
         val title     = intent.getStringExtra(EXTRA_TITLE) ?: "Web App"
