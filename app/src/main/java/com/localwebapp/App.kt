@@ -277,15 +277,13 @@ class MainActivity : AppCompatActivity() {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// NativeAudioRecorder — uses AudioRecord for PCM capture with full waveform,
-// pause/resume support, and WAV encoding. Bypasses broken WebView mic access.
+// NativeAudioRecorder — unchanged from previous version
 // ═══════════════════════════════════════════════════════════════════════════════
 class NativeAudioRecorder {
-
     companion object {
-        private const val SAMPLE_RATE    = 44100
-        private const val CHANNEL_CONFIG = AudioFormat.CHANNEL_IN_MONO
-        private const val AUDIO_FORMAT   = AudioFormat.ENCODING_PCM_16BIT
+        private const val SAMPLE_RATE      = 44100
+        private const val CHANNEL_CONFIG   = AudioFormat.CHANNEL_IN_MONO
+        private const val AUDIO_FORMAT     = AudioFormat.ENCODING_PCM_16BIT
         private const val BYTES_PER_SAMPLE = 2
         private const val NUM_CHANNELS     = 1
     }
@@ -294,110 +292,61 @@ class NativeAudioRecorder {
     private var recordThread: Thread? = null
     @Volatile private var isRecording = false
     @Volatile private var isPaused    = false
-
-    // Raw PCM buffer — all captured samples, interleaved as 16-bit LE
     private val pcmBuffer = ByteArrayOutputStream()
-
-    // Recent amplitude samples for waveform (ring buffer of floats 0.0-1.0)
     private val waveformRing = FloatArray(256)
     private var waveformIdx  = 0
     @Volatile private var currentAmplitude = 0
-
     private var minBufferSize = 0
 
     @SuppressLint("MissingPermission")
     fun start(): String {
         if (isRecording) return "error:already recording"
-
         return try {
             minBufferSize = AudioRecord.getMinBufferSize(SAMPLE_RATE, CHANNEL_CONFIG, AUDIO_FORMAT)
             if (minBufferSize <= 0) return "error:invalid buffer size"
-
-            val bufSize = minBufferSize * 2 // double for safety
-            val rec = AudioRecord(
-                MediaRecorder.AudioSource.MIC,
-                SAMPLE_RATE, CHANNEL_CONFIG, AUDIO_FORMAT,
-                bufSize
-            )
-
+            val rec = AudioRecord(MediaRecorder.AudioSource.MIC, SAMPLE_RATE,
+                CHANNEL_CONFIG, AUDIO_FORMAT, minBufferSize * 2)
             if (rec.state != AudioRecord.STATE_INITIALIZED) {
-                rec.release()
-                return "error:AudioRecord not initialized"
+                rec.release(); return "error:AudioRecord not initialized"
             }
-
-            pcmBuffer.reset()
-            waveformIdx = 0
-            currentAmplitude = 0
-            isPaused = false
-            isRecording = true
-
-            rec.startRecording()
-            recorder = rec
-
-            // Capture thread
+            pcmBuffer.reset(); waveformIdx = 0; currentAmplitude = 0
+            isPaused = false; isRecording = true
+            rec.startRecording(); recorder = rec
             recordThread = thread(start = true, name = "NativeAudioCapture") {
                 val readBuf = ShortArray(minBufferSize)
                 val byteBuf = ByteArray(minBufferSize * 2)
-
                 while (isRecording) {
-                    val samplesRead = try {
-                        rec.read(readBuf, 0, readBuf.size)
-                    } catch (e: Exception) { -1 }
-
-                    if (samplesRead <= 0) {
-                        if (samplesRead < 0) android.util.Log.e("NativeAudio", "read error $samplesRead")
-                        continue
-                    }
-
-                    if (isPaused) continue  // discard samples while paused
-
-                    // Compute peak amplitude for waveform
+                    val n = try { rec.read(readBuf, 0, readBuf.size) } catch (e: Exception) { -1 }
+                    if (n <= 0) continue
+                    if (isPaused) continue
                     var peak = 0
-                    for (i in 0 until samplesRead) {
+                    for (i in 0 until n) {
                         val abs = Math.abs(readBuf[i].toInt())
                         if (abs > peak) peak = abs
                     }
                     currentAmplitude = peak
-
-                    // Save peak to ring buffer as 0.0-1.0
                     val normalized = peak / 32767.0f
                     synchronized(waveformRing) {
                         waveformRing[waveformIdx] = normalized
                         waveformIdx = (waveformIdx + 1) % waveformRing.size
                     }
-
-                    // Append PCM samples (little-endian 16-bit) to buffer
-                    for (i in 0 until samplesRead) {
+                    for (i in 0 until n) {
                         val s = readBuf[i].toInt()
                         byteBuf[i * 2]     = (s and 0xFF).toByte()
                         byteBuf[i * 2 + 1] = ((s shr 8) and 0xFF).toByte()
                     }
-                    synchronized(pcmBuffer) {
-                        pcmBuffer.write(byteBuf, 0, samplesRead * 2)
-                    }
+                    synchronized(pcmBuffer) { pcmBuffer.write(byteBuf, 0, n * 2) }
                 }
             }
-
-            android.util.Log.d("NativeAudio", "Recording started, sample rate $SAMPLE_RATE")
             "ok"
         } catch (e: Exception) {
             android.util.Log.e("NativeAudio", "Start failed", e)
-            cleanup()
-            "error:${e.message ?: e.javaClass.simpleName}"
+            cleanup(); "error:${e.message ?: e.javaClass.simpleName}"
         }
     }
 
-    fun pause(): String {
-        if (!isRecording) return "error:not recording"
-        isPaused = true
-        return "ok"
-    }
-
-    fun resume(): String {
-        if (!isRecording) return "error:not recording"
-        isPaused = false
-        return "ok"
-    }
+    fun pause():  String { if (!isRecording) return "error:not recording"; isPaused = true;  return "ok" }
+    fun resume(): String { if (!isRecording) return "error:not recording"; isPaused = false; return "ok" }
 
     fun stop(): String {
         if (!isRecording) return "error:not recording"
@@ -408,33 +357,21 @@ class NativeAudioRecorder {
             try { recorder?.stop() } catch (e: Exception) {}
             try { recorder?.release() } catch (e: Exception) {}
             recorder = null
-
             val pcmBytes = synchronized(pcmBuffer) { pcmBuffer.toByteArray() }
             if (pcmBytes.isEmpty()) return "error:empty recording"
-
-            // Wrap PCM in WAV header so browser MediaElement can play it
             val wavBytes = pcmToWav(pcmBytes, SAMPLE_RATE, NUM_CHANNELS, BYTES_PER_SAMPLE * 8)
             val base64   = Base64.encodeToString(wavBytes, Base64.NO_WRAP)
-            android.util.Log.d("NativeAudio", "Stopped, ${wavBytes.size} bytes WAV")
             pcmBuffer.reset()
             "data:audio/wav;base64,$base64"
         } catch (e: Exception) {
-            android.util.Log.e("NativeAudio", "Stop failed", e)
-            cleanup()
-            "error:${e.message ?: e.javaClass.simpleName}"
+            cleanup(); "error:${e.message ?: e.javaClass.simpleName}"
         }
     }
 
-    /**
-     * Return the most-recent waveform samples as a comma-separated string
-     * of values in [0.0, 1.0]. Returns exactly `count` values. Most recent
-     * sample is last.
-     */
     fun getWaveform(count: Int): String {
         val n = count.coerceIn(1, waveformRing.size)
         val out = StringBuilder()
         synchronized(waveformRing) {
-            // Read the last `n` samples from the ring buffer, oldest first
             var idx = (waveformIdx - n + waveformRing.size) % waveformRing.size
             for (i in 0 until n) {
                 if (i > 0) out.append(',')
@@ -445,64 +382,40 @@ class NativeAudioRecorder {
         return out.toString()
     }
 
-    fun getAmplitude(): Int = currentAmplitude
-    fun isActive():    Boolean = isRecording
+    fun getAmplitude():  Int     = currentAmplitude
+    fun isActive():      Boolean = isRecording
     fun isPausedState(): Boolean = isPaused
 
     private fun cleanup() {
         isRecording = false
         try { recorder?.stop() } catch (e: Exception) {}
         try { recorder?.release() } catch (e: Exception) {}
-        recorder = null
-        recordThread = null
-        pcmBuffer.reset()
+        recorder = null; recordThread = null; pcmBuffer.reset()
     }
 
-    /**
-     * Wrap raw PCM data in a WAV container so it plays in HTML <audio> elements.
-     * Standard 44-byte RIFF/WAVE/fmt/data header for uncompressed PCM.
-     */
-    private fun pcmToWav(
-        pcm: ByteArray, sampleRate: Int, channels: Int, bitsPerSample: Int
-    ): ByteArray {
+    private fun pcmToWav(pcm: ByteArray, sampleRate: Int, channels: Int, bitsPerSample: Int): ByteArray {
         val pcmLen     = pcm.size
         val totalLen   = pcmLen + 36
         val byteRate   = sampleRate * channels * bitsPerSample / 8
         val blockAlign = channels * bitsPerSample / 8
         val out = ByteArray(pcmLen + 44)
-
-        // RIFF header
-        out[0] = 'R'.code.toByte(); out[1] = 'I'.code.toByte()
-        out[2] = 'F'.code.toByte(); out[3] = 'F'.code.toByte()
-        out[4] = (totalLen and 0xFF).toByte()
-        out[5] = ((totalLen shr 8)  and 0xFF).toByte()
-        out[6] = ((totalLen shr 16) and 0xFF).toByte()
-        out[7] = ((totalLen shr 24) and 0xFF).toByte()
-        out[8] = 'W'.code.toByte(); out[9]  = 'A'.code.toByte()
-        out[10] = 'V'.code.toByte(); out[11] = 'E'.code.toByte()
-        // fmt subchunk
-        out[12] = 'f'.code.toByte(); out[13] = 'm'.code.toByte()
-        out[14] = 't'.code.toByte(); out[15] = ' '.code.toByte()
-        out[16] = 16; out[17] = 0; out[18] = 0; out[19] = 0  // subchunk size = 16
-        out[20] = 1;  out[21] = 0                             // PCM format
-        out[22] = channels.toByte(); out[23] = 0
-        out[24] = (sampleRate and 0xFF).toByte()
-        out[25] = ((sampleRate shr 8)  and 0xFF).toByte()
-        out[26] = ((sampleRate shr 16) and 0xFF).toByte()
-        out[27] = ((sampleRate shr 24) and 0xFF).toByte()
-        out[28] = (byteRate and 0xFF).toByte()
-        out[29] = ((byteRate shr 8)  and 0xFF).toByte()
-        out[30] = ((byteRate shr 16) and 0xFF).toByte()
-        out[31] = ((byteRate shr 24) and 0xFF).toByte()
-        out[32] = blockAlign.toByte(); out[33] = 0
-        out[34] = bitsPerSample.toByte(); out[35] = 0
-        // data subchunk
-        out[36] = 'd'.code.toByte(); out[37] = 'a'.code.toByte()
-        out[38] = 't'.code.toByte(); out[39] = 'a'.code.toByte()
-        out[40] = (pcmLen and 0xFF).toByte()
-        out[41] = ((pcmLen shr 8)  and 0xFF).toByte()
-        out[42] = ((pcmLen shr 16) and 0xFF).toByte()
-        out[43] = ((pcmLen shr 24) and 0xFF).toByte()
+        out[0]='R'.code.toByte(); out[1]='I'.code.toByte(); out[2]='F'.code.toByte(); out[3]='F'.code.toByte()
+        out[4]=(totalLen and 0xFF).toByte(); out[5]=((totalLen shr 8) and 0xFF).toByte()
+        out[6]=((totalLen shr 16) and 0xFF).toByte(); out[7]=((totalLen shr 24) and 0xFF).toByte()
+        out[8]='W'.code.toByte(); out[9]='A'.code.toByte(); out[10]='V'.code.toByte(); out[11]='E'.code.toByte()
+        out[12]='f'.code.toByte(); out[13]='m'.code.toByte(); out[14]='t'.code.toByte(); out[15]=' '.code.toByte()
+        out[16]=16; out[17]=0; out[18]=0; out[19]=0
+        out[20]=1;  out[21]=0
+        out[22]=channels.toByte(); out[23]=0
+        out[24]=(sampleRate and 0xFF).toByte(); out[25]=((sampleRate shr 8) and 0xFF).toByte()
+        out[26]=((sampleRate shr 16) and 0xFF).toByte(); out[27]=((sampleRate shr 24) and 0xFF).toByte()
+        out[28]=(byteRate and 0xFF).toByte(); out[29]=((byteRate shr 8) and 0xFF).toByte()
+        out[30]=((byteRate shr 16) and 0xFF).toByte(); out[31]=((byteRate shr 24) and 0xFF).toByte()
+        out[32]=blockAlign.toByte(); out[33]=0
+        out[34]=bitsPerSample.toByte(); out[35]=0
+        out[36]='d'.code.toByte(); out[37]='a'.code.toByte(); out[38]='t'.code.toByte(); out[39]='a'.code.toByte()
+        out[40]=(pcmLen and 0xFF).toByte(); out[41]=((pcmLen shr 8) and 0xFF).toByte()
+        out[42]=((pcmLen shr 16) and 0xFF).toByte(); out[43]=((pcmLen shr 24) and 0xFF).toByte()
         System.arraycopy(pcm, 0, out, 44, pcmLen)
         return out
     }
@@ -515,63 +428,34 @@ class WebAppActivity : AppCompatActivity() {
         const val EXTRA_TITLE = "extra_title"
         private const val NET_CACHE = "netcache"
 
-        /**
-         * Transparent audio shim injected after every page load.
-         *
-         * Patches navigator.mediaDevices.getUserMedia() + MediaRecorder +
-         * AudioContext.createMediaStreamSource() for audio-only recording so
-         * web apps using standard Web APIs get reliable mic access even when
-         * the underlying WebView's getUserMedia is broken (Samsung A55,
-         * Android 14, OnePlus Nord etc. — "NotReadableError" bug).
-         *
-         * Under the hood:
-         *   - navigator.mediaDevices.getUserMedia({audio:true})
-         *       → returns fake MediaStream (flag __lwa = true)
-         *   - new MediaRecorder(fakeStream)
-         *       → routes start/stop/pause/resume through Android.rec*
-         *       → fires standard dataavailable/start/stop/pause/resume events
-         *         with a real Blob (WAV format)
-         *   - audioCtx.createMediaStreamSource(fakeStream)
-         *       → returns an analyser-compatible node that emits synthetic
-         *         time-domain data based on live waveform samples polled
-         *         from Android.recWaveform()
-         *   - Video requests pass through unchanged.
-         */
         private const val AUDIO_SHIM_JS = """
 (function(){
   if (typeof Android === 'undefined' || typeof Android.recStart !== 'function') return;
   if (window.__lwa_shim_v2) return;
   window.__lwa_shim_v2 = true;
-  console.log('[LWA] transparent native audio shim v2');
 
   var origGUM = navigator.mediaDevices && navigator.mediaDevices.getUserMedia
                 ? navigator.mediaDevices.getUserMedia.bind(navigator.mediaDevices) : null;
   var OrigMR = window.MediaRecorder;
   var OrigAC = window.AudioContext || window.webkitAudioContext;
 
-  // ── Fake track ───────────────────────────────────────────────────────────
   function makeTrack() {
     return {
-      kind: 'audio',
-      id: 'lwa-track-' + Math.random().toString(36).slice(2),
+      kind: 'audio', id: 'lwa-track-' + Math.random().toString(36).slice(2),
       label: 'Native Android Microphone',
       enabled: true, muted: false, readyState: 'live', contentHint: '',
       stop: function(){ this.readyState='ended'; this.enabled=false; },
       getSettings: function(){ return {sampleRate:44100, channelCount:1, deviceId:'native'}; },
-      getCapabilities: function(){ return {}; },
-      getConstraints: function(){ return {}; },
+      getCapabilities: function(){ return {}; }, getConstraints: function(){ return {}; },
       applyConstraints: function(){ return Promise.resolve(); },
       clone: function(){ return makeTrack(); },
       addEventListener: function(){}, removeEventListener: function(){},
       dispatchEvent: function(){ return true; }
     };
   }
-
-  // ── Fake stream ──────────────────────────────────────────────────────────
   function NativeStream() {
     this.id = 'lwa-stream-' + Math.random().toString(36).slice(2);
-    this.active = true;
-    this.__lwa = true;
+    this.active = true; this.__lwa = true;
     this._tracks = [makeTrack()];
   }
   NativeStream.prototype.getTracks      = function(){ return this._tracks.slice(); };
@@ -580,22 +464,17 @@ class WebAppActivity : AppCompatActivity() {
   NativeStream.prototype.getTrackById = function(id){
     return this._tracks.filter(function(t){return t.id===id;})[0] || null;
   };
-  NativeStream.prototype.addTrack    = function(){};
-  NativeStream.prototype.removeTrack = function(){};
-  NativeStream.prototype.clone       = function(){ return new NativeStream(); };
-  NativeStream.prototype.addEventListener    = function(){};
-  NativeStream.prototype.removeEventListener = function(){};
-  NativeStream.prototype.dispatchEvent       = function(){ return true; };
+  NativeStream.prototype.addTrack=function(){}; NativeStream.prototype.removeTrack=function(){};
+  NativeStream.prototype.clone=function(){ return new NativeStream(); };
+  NativeStream.prototype.addEventListener=function(){};
+  NativeStream.prototype.removeEventListener=function(){};
+  NativeStream.prototype.dispatchEvent=function(){ return true; };
 
-  // ── Patch getUserMedia ───────────────────────────────────────────────────
   if (navigator.mediaDevices) {
     navigator.mediaDevices.getUserMedia = function(constraints) {
       var wantA = !!(constraints && constraints.audio);
       var wantV = !!(constraints && constraints.video);
-      if (wantA && !wantV) {
-        console.log('[LWA] getUserMedia(audio) → native');
-        return Promise.resolve(new NativeStream());
-      }
+      if (wantA && !wantV) return Promise.resolve(new NativeStream());
       if (origGUM) return origGUM(constraints);
       return Promise.reject(new DOMException('getUserMedia unavailable','NotSupportedError'));
     };
@@ -604,21 +483,16 @@ class WebAppActivity : AppCompatActivity() {
     navigator.mediaDevices.enumerateDevices = function() {
       var fake = [{deviceId:'native', groupId:'native', kind:'audioinput',
                    label:'Native Android Microphone'}];
-      if (origEnum) {
-        return origEnum().then(function(list){
-          var filtered = list.filter(function(d){ return d.kind !== 'audioinput'; });
-          return fake.concat(filtered);
-        }).catch(function(){ return fake; });
-      }
+      if (origEnum) return origEnum().then(function(list){
+        return fake.concat(list.filter(function(d){ return d.kind !== 'audioinput'; }));
+      }).catch(function(){ return fake; });
       return Promise.resolve(fake);
     };
   }
 
-  // ── Patch MediaRecorder ──────────────────────────────────────────────────
   function NativeMR(stream, options) {
     this._handlers = {};
     this._native = !!(stream && stream.__lwa);
-
     if (!this._native && OrigMR) {
       var self = this;
       this._real = new OrigMR(stream, options);
@@ -627,23 +501,16 @@ class WebAppActivity : AppCompatActivity() {
       });
       Object.defineProperty(this, 'state',    { get: function(){ return self._real.state; }});
       Object.defineProperty(this, 'mimeType', { get: function(){ return self._real.mimeType; }});
-      this.stream = stream;
-      return;
+      this.stream = stream; return;
     }
-
-    this._state   = 'inactive';
-    this.stream   = stream;
-    this.mimeType = 'audio/wav';
-    this.audioBitsPerSecond = 705600;  // 44100 * 16
-    this.videoBitsPerSecond = 0;
+    this._state = 'inactive'; this.stream = stream; this.mimeType = 'audio/wav';
+    this.audioBitsPerSecond = 705600; this.videoBitsPerSecond = 0;
     var self = this;
     Object.defineProperty(this, 'state', { get: function(){ return self._state; }});
   }
-
   NativeMR.prototype._fire = function(ev, detail) {
     var handlers = (this._handlers[ev] || []).slice();
-    var evt;
-    try { evt = new Event(ev); } catch(e) { evt = { type: ev }; }
+    var evt; try { evt = new Event(ev); } catch(e) { evt = { type: ev }; }
     if (detail) for (var k in detail) try { evt[k] = detail[k]; } catch(_) {}
     handlers.forEach(function(h){ try { h(evt); } catch(e) { console.error(e); } });
     var cb = this['on' + ev];
@@ -657,21 +524,16 @@ class WebAppActivity : AppCompatActivity() {
     this._handlers[ev] = this._handlers[ev].filter(function(x){ return x !== fn; });
   };
   NativeMR.prototype.dispatchEvent = function(){ return true; };
-
   NativeMR.prototype.start = function(timeslice) {
     if (!this._native) return this._real.start(timeslice);
     if (this._state !== 'inactive') return;
     var r = Android.recStart();
     if (r !== 'ok') {
-      var err = new Error(r);
-      err.name = 'NotReadableError';
-      this._fire('error', { error: err });
-      return;
+      var err = new Error(r); err.name = 'NotReadableError';
+      this._fire('error', { error: err }); return;
     }
-    this._state = 'recording';
-    this._fire('start');
+    this._state = 'recording'; this._fire('start');
   };
-
   NativeMR.prototype.stop = function() {
     if (!this._native) return this._real.stop();
     if (this._state === 'inactive') return;
@@ -686,24 +548,19 @@ class WebAppActivity : AppCompatActivity() {
       this._fire('dataavailable', { data: blob });
       this._fire('stop');
     } else {
-      var e = new Error(dataUrl || 'recStop failed');
-      e.name = 'AbortError';
-      this._fire('error', { error: e });
-      this._fire('stop');
+      var e = new Error(dataUrl || 'recStop failed'); e.name = 'AbortError';
+      this._fire('error', { error: e }); this._fire('stop');
     }
   };
-
   NativeMR.prototype.pause = function() {
     if (!this._native) return this._real.pause();
     if (this._state !== 'recording') return;
-    var r = Android.recPause();
-    if (r === 'ok') { this._state = 'paused'; this._fire('pause'); }
+    if (Android.recPause() === 'ok') { this._state='paused'; this._fire('pause'); }
   };
   NativeMR.prototype.resume = function() {
     if (!this._native) return this._real.resume();
     if (this._state !== 'paused') return;
-    var r = Android.recResume();
-    if (r === 'ok') { this._state = 'recording'; this._fire('resume'); }
+    if (Android.recResume() === 'ok') { this._state='recording'; this._fire('resume'); }
   };
   NativeMR.prototype.requestData = function() {
     if (!this._native && this._real) this._real.requestData();
@@ -715,50 +572,33 @@ class WebAppActivity : AppCompatActivity() {
   };
   window.MediaRecorder = NativeMR;
 
-  // ── Patch AudioContext.createMediaStreamSource for live waveforms ────────
-  // When apps feed our fake stream into an AnalyserNode, they expect
-  // getByteTimeDomainData() to give real-time sample data. We intercept
-  // the analyser's getByteTimeDomainData / getFloatTimeDomainData /
-  // getByteFrequencyData and populate them with samples from Android.recWaveform().
   if (OrigAC) {
     var origCreateSrc = OrigAC.prototype.createMediaStreamSource;
     var origCreateAna = OrigAC.prototype.createAnalyser;
-
     OrigAC.prototype.createMediaStreamSource = function(stream) {
       if (!stream || !stream.__lwa) return origCreateSrc.call(this, stream);
-      var ctx = this;
-      var src = ctx.createGain();   // silent placeholder node
-      src.gain.value = 0;
-      src.__lwa = true;
+      var src = this.createGain(); src.gain.value = 0; src.__lwa = true;
+      var origConnect = src.connect.bind(src);
       src.connect = function(dest) {
-        // When connected to an analyser, mark that analyser as LWA-fed
         if (dest && dest.__lwa_analyser) dest.__lwa_src = src;
-        else if (dest && dest.constructor && dest.constructor.name === 'AnalyserNode') {
-          dest.__lwa_src = src;
-        }
-        return Object.getPrototypeOf(src).connect.call(src, dest);
+        return origConnect(dest);
       };
       return src;
     };
-
     OrigAC.prototype.createAnalyser = function() {
       var analyser = origCreateAna.call(this);
       analyser.__lwa_analyser = true;
-      var origGetByteTD = analyser.getByteTimeDomainData.bind(analyser);
-      var origGetFloatTD = analyser.getFloatTimeDomainData
-                         ? analyser.getFloatTimeDomainData.bind(analyser) : null;
-      var origGetByteFD = analyser.getByteFrequencyData.bind(analyser);
-
+      var origGetByteTD  = analyser.getByteTimeDomainData.bind(analyser);
+      var origGetFloatTD = analyser.getFloatTimeDomainData ? analyser.getFloatTimeDomainData.bind(analyser) : null;
+      var origGetByteFD  = analyser.getByteFrequencyData.bind(analyser);
       analyser.getByteTimeDomainData = function(arr) {
         if (!this.__lwa_src) return origGetByteTD(arr);
         fillByteTimeDomain(arr);
       };
-      if (origGetFloatTD) {
-        analyser.getFloatTimeDomainData = function(arr) {
-          if (!this.__lwa_src) return origGetFloatTD(arr);
-          fillFloatTimeDomain(arr);
-        };
-      }
+      if (origGetFloatTD) analyser.getFloatTimeDomainData = function(arr) {
+        if (!this.__lwa_src) return origGetFloatTD(arr);
+        fillFloatTimeDomain(arr);
+      };
       analyser.getByteFrequencyData = function(arr) {
         if (!this.__lwa_src) return origGetByteFD(arr);
         fillByteFrequency(arr);
@@ -766,59 +606,187 @@ class WebAppActivity : AppCompatActivity() {
       return analyser;
     };
   }
-
   function getWaveform(n) {
-    try {
-      var s = Android.recWaveform(n);
-      if (!s) return null;
-      return s.split(',').map(parseFloat);
-    } catch(e) { return null; }
+    try { var s = Android.recWaveform(n); return s ? s.split(',').map(parseFloat) : null; }
+    catch(e) { return null; }
   }
-
   function fillByteTimeDomain(arr) {
-    // Format: Uint8Array, 128 = silence, 0-255 range
     var wave = getWaveform(Math.min(arr.length, 256));
-    if (!wave) {
-      for (var i = 0; i < arr.length; i++) arr[i] = 128;
-      return;
-    }
-    // Up-sample wave[] to arr.length with linear interp, expand 0-1 → 0-255 bipolar
-    var amp = Android.recAmplitude() / 32767.0;
+    if (!wave) { for (var i = 0; i < arr.length; i++) arr[i] = 128; return; }
     for (var i = 0; i < arr.length; i++) {
       var t = (i / arr.length) * (wave.length - 1);
-      var idx = Math.floor(t);
-      var frac = t - idx;
+      var idx = Math.floor(t), frac = t - idx;
       var v = wave[idx] * (1-frac) + (wave[idx+1] || wave[idx]) * frac;
-      // synthesize a sine-ish wave modulated by amplitude envelope
-      var phase = (i / arr.length) * Math.PI * 2 * 8; // 8 cycles across buffer
-      var sample = Math.sin(phase) * v;
-      arr[i] = Math.max(0, Math.min(255, 128 + sample * 120));
+      var phase = (i / arr.length) * Math.PI * 2 * 8;
+      arr[i] = Math.max(0, Math.min(255, 128 + Math.sin(phase) * v * 120));
     }
   }
-
   function fillFloatTimeDomain(arr) {
     var wave = getWaveform(Math.min(arr.length, 256));
     if (!wave) { for (var i = 0; i < arr.length; i++) arr[i] = 0; return; }
     for (var i = 0; i < arr.length; i++) {
       var t = (i / arr.length) * (wave.length - 1);
-      var idx = Math.floor(t);
-      var frac = t - idx;
+      var idx = Math.floor(t), frac = t - idx;
       var v = wave[idx] * (1-frac) + (wave[idx+1] || wave[idx]) * frac;
       var phase = (i / arr.length) * Math.PI * 2 * 8;
       arr[i] = Math.sin(phase) * v;
     }
   }
-
   function fillByteFrequency(arr) {
-    // Frequency spectrum: fake a typical voice spectrum based on amplitude
     var amp = Android.recAmplitude() / 32767.0;
     for (var i = 0; i < arr.length; i++) {
-      // Voice-shaped falloff: more energy in low freqs
-      var freqWeight = Math.pow(1 - (i / arr.length), 1.5);
-      var noise = Math.random() * 0.5 + 0.5;
-      arr[i] = Math.min(255, amp * freqWeight * noise * 255);
+      var w = Math.pow(1 - (i / arr.length), 1.5);
+      arr[i] = Math.min(255, amp * w * (Math.random() * 0.5 + 0.5) * 255);
     }
   }
+})();
+"""
+
+        /**
+         * File-system shim: makes `fetch('./path', {method:'PUT', body})` work
+         * so web apps can transparently write files into the SAF folder on disk.
+         * Also patches GET for files to bypass the HTTP server's port-change
+         * origin issue (same-path reads work). PUT/POST writes via HTTP to
+         * same origin; DELETE removes a file.
+         *
+         * Web apps just use standard fetch() — nothing to learn.
+         *
+         * Also exposes window.AndroidFS for apps that want a more direct API:
+         *   await AndroidFS.read('notes/notes.json')     → string or null
+         *   await AndroidFS.write('notes/notes.json', s) → true/false
+         *   await AndroidFS.delete('notes/notes.json')   → true/false
+         *   await AndroidFS.list('notes')                → string[]
+         *   await AndroidFS.exists('notes/notes.json')   → boolean
+         */
+        private const val FS_SHIM_JS = """
+(function(){
+  if (typeof Android === 'undefined' || typeof Android.fsWrite !== 'function') return;
+  if (window.__lwa_fs_shim_v1) return;
+  window.__lwa_fs_shim_v1 = true;
+
+  window.AndroidFS = {
+    read: function(path) {
+      return new Promise(function(res) {
+        try {
+          var r = Android.fsRead(path);
+          if (r === null || r === undefined) return res(null);
+          res(r);
+        } catch(e) { res(null); }
+      });
+    },
+    write: function(path, content) {
+      return new Promise(function(res) {
+        try {
+          var s = (typeof content === 'string') ? content : JSON.stringify(content);
+          res(Android.fsWrite(path, s) === 'ok');
+        } catch(e) { res(false); }
+      });
+    },
+    writeBytes: function(path, uint8array) {
+      return new Promise(function(res) {
+        try {
+          var b64 = '';
+          var chunks = [];
+          for (var i = 0; i < uint8array.length; i += 0x8000) {
+            chunks.push(String.fromCharCode.apply(null, uint8array.subarray(i, i + 0x8000)));
+          }
+          b64 = btoa(chunks.join(''));
+          res(Android.fsWriteBase64(path, b64) === 'ok');
+        } catch(e) { res(false); }
+      });
+    },
+    readBytes: function(path) {
+      return new Promise(function(res) {
+        try {
+          var b64 = Android.fsReadBase64(path);
+          if (!b64) return res(null);
+          var bin = atob(b64);
+          var arr = new Uint8Array(bin.length);
+          for (var i = 0; i < bin.length; i++) arr[i] = bin.charCodeAt(i);
+          res(arr);
+        } catch(e) { res(null); }
+      });
+    },
+    delete: function(path) {
+      return new Promise(function(res) {
+        try { res(Android.fsDelete(path) === 'ok'); }
+        catch(e) { res(false); }
+      });
+    },
+    list: function(path) {
+      return new Promise(function(res) {
+        try {
+          var s = Android.fsList(path || '');
+          res(s ? s.split('\n').filter(function(x){ return x.length > 0; }) : []);
+        } catch(e) { res([]); }
+      });
+    },
+    exists: function(path) {
+      return new Promise(function(res) {
+        try { res(Android.fsExists(path)); }
+        catch(e) { res(false); }
+      });
+    },
+    mkdir: function(path) {
+      return new Promise(function(res) {
+        try { res(Android.fsMkdir(path) === 'ok'); }
+        catch(e) { res(false); }
+      });
+    }
+  };
+
+  // Also patch fetch() so PUT/DELETE/POST requests to the app's own origin
+  // write/delete files in the SAF folder. This makes standard web code work:
+  //     fetch('./notes.json', {method:'PUT', body: JSON.stringify(data)});
+  var origFetch = window.fetch ? window.fetch.bind(window) : null;
+  window.fetch = function(input, init) {
+    var url = (typeof input === 'string') ? input : (input && input.url);
+    var method = (init && init.method ? init.method : 'GET').toUpperCase();
+
+    // Same-origin writes → route to native FS
+    if (url && method !== 'GET' && method !== 'HEAD') {
+      var u; try { u = new URL(url, location.href); } catch(e) { u = null; }
+      if (u && u.origin === location.origin) {
+        var path = decodeURIComponent(u.pathname.replace(/^\//, ''));
+        if (method === 'PUT' || method === 'POST') {
+          var body = init && init.body;
+          return new Promise(function(resolve) {
+            var done = function(ok) {
+              resolve(new Response(ok ? 'ok' : 'fail', {
+                status: ok ? 200 : 500,
+                headers: { 'Content-Type': 'text/plain' }
+              }));
+            };
+            if (body instanceof Blob) {
+              body.arrayBuffer().then(function(ab){
+                var u8 = new Uint8Array(ab);
+                window.AndroidFS.writeBytes(path, u8).then(done);
+              });
+            } else if (body instanceof ArrayBuffer) {
+              window.AndroidFS.writeBytes(path, new Uint8Array(body)).then(done);
+            } else if (typeof body === 'string') {
+              window.AndroidFS.write(path, body).then(done);
+            } else if (body == null) {
+              window.AndroidFS.write(path, '').then(done);
+            } else {
+              try {
+                window.AndroidFS.write(path, JSON.stringify(body)).then(done);
+              } catch(e) { done(false); }
+            }
+          });
+        }
+        if (method === 'DELETE') {
+          return window.AndroidFS.delete(path).then(function(ok) {
+            return new Response(ok ? 'ok' : 'fail', { status: ok ? 200 : 500 });
+          });
+        }
+      }
+    }
+    return origFetch ? origFetch(input, init)
+                     : Promise.reject(new Error('fetch unavailable'));
+  };
+
+  console.log('[LWA] filesystem shim active — fetch() PUT/DELETE and AndroidFS.* ready');
 })();
 """
     }
@@ -874,6 +842,135 @@ class WebAppActivity : AppCompatActivity() {
     }
 
     private val netCacheDir by lazy { File(filesDir, NET_CACHE).also { it.mkdirs() } }
+
+    // ═════════════════════════════════════════════════════════════════════════
+    // SAF filesystem helpers — lets the JS bridge read/write files in the
+    // user-picked folder so web apps have real persistent storage on disk.
+    // ═════════════════════════════════════════════════════════════════════════
+
+    /**
+     * Resolve a relative path like "notes/notes.json" against the root SAF
+     * folder. Returns null if any segment is missing when create=false, or
+     * auto-creates directories/file when create=true.
+     */
+    private fun resolveSafPath(path: String, createFile: Boolean): DocumentFile? {
+        val root = DocumentFile.fromTreeUri(this, folderUri) ?: return null
+        val segments = path.split("/", "\\")
+            .filter { it.isNotEmpty() && it != ".." && it != "." }
+        if (segments.isEmpty()) return null
+
+        var node: DocumentFile = root
+        for (i in 0 until segments.size - 1) {
+            val name = segments[i]
+            val child = node.findFile(name)
+            node = if (child != null && child.isDirectory) child
+                   else if (createFile) node.createDirectory(name) ?: return null
+                   else return null
+        }
+        val leaf = segments.last()
+        val existing = node.findFile(leaf)
+        if (existing != null) return existing
+        if (createFile) return node.createFile("application/octet-stream", leaf)
+        return null
+    }
+
+    private fun fsRead(path: String): String? {
+        return try {
+            val file = resolveSafPath(path, createFile = false) ?: return null
+            if (!file.isFile) return null
+            contentResolver.openInputStream(file.uri)?.use { it.readBytes() }
+                ?.toString(Charsets.UTF_8)
+        } catch (e: Exception) {
+            android.util.Log.e("LWA-FS", "read failed $path: ${e.message}")
+            null
+        }
+    }
+
+    private fun fsWrite(path: String, content: String): String {
+        return try {
+            val file = resolveSafPath(path, createFile = true) ?: return "error:path"
+            contentResolver.openOutputStream(file.uri, "wt")?.use {
+                it.write(content.toByteArray(Charsets.UTF_8))
+            } ?: return "error:no output stream"
+            "ok"
+        } catch (e: Exception) {
+            android.util.Log.e("LWA-FS", "write failed $path: ${e.message}")
+            "error:${e.message}"
+        }
+    }
+
+    private fun fsReadBase64(path: String): String? {
+        return try {
+            val file = resolveSafPath(path, createFile = false) ?: return null
+            if (!file.isFile) return null
+            val bytes = contentResolver.openInputStream(file.uri)?.use { it.readBytes() } ?: return null
+            Base64.encodeToString(bytes, Base64.NO_WRAP)
+        } catch (e: Exception) {
+            android.util.Log.e("LWA-FS", "readBytes failed $path: ${e.message}")
+            null
+        }
+    }
+
+    private fun fsWriteBase64(path: String, b64: String): String {
+        return try {
+            val file = resolveSafPath(path, createFile = true) ?: return "error:path"
+            val bytes = Base64.decode(b64, Base64.DEFAULT)
+            contentResolver.openOutputStream(file.uri, "wt")?.use { it.write(bytes) }
+                ?: return "error:no output stream"
+            "ok"
+        } catch (e: Exception) {
+            "error:${e.message}"
+        }
+    }
+
+    private fun fsDelete(path: String): String {
+        return try {
+            val file = resolveSafPath(path, createFile = false) ?: return "error:not found"
+            if (file.delete()) "ok" else "error:delete failed"
+        } catch (e: Exception) {
+            "error:${e.message}"
+        }
+    }
+
+    private fun fsList(path: String): String {
+        return try {
+            val node = if (path.isEmpty() || path == "/" || path == ".") {
+                DocumentFile.fromTreeUri(this, folderUri)
+            } else {
+                // Navigate into dir
+                val root = DocumentFile.fromTreeUri(this, folderUri) ?: return ""
+                val segments = path.split("/", "\\")
+                    .filter { it.isNotEmpty() && it != ".." && it != "." }
+                var n: DocumentFile = root
+                for (seg in segments) { n = n.findFile(seg) ?: return ""; if (!n.isDirectory) return "" }
+                n
+            } ?: return ""
+            node.listFiles().mapNotNull { it.name }.joinToString("\n")
+        } catch (e: Exception) { "" }
+    }
+
+    private fun fsExists(path: String): Boolean {
+        return try {
+            val file = resolveSafPath(path, createFile = false)
+            file != null && file.exists()
+        } catch (e: Exception) { false }
+    }
+
+    private fun fsMkdir(path: String): String {
+        return try {
+            val root = DocumentFile.fromTreeUri(this, folderUri) ?: return "error:root"
+            val segments = path.split("/", "\\")
+                .filter { it.isNotEmpty() && it != ".." && it != "." }
+            if (segments.isEmpty()) return "error:empty path"
+            var node: DocumentFile = root
+            for (name in segments) {
+                val child = node.findFile(name)
+                node = if (child != null && child.isDirectory) child
+                       else node.createDirectory(name) ?: return "error:mkdir $name"
+            }
+            "ok"
+        } catch (e: Exception) { "error:${e.message}" }
+    }
 
     @SuppressLint("SetJavaScriptEnabled")
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -954,7 +1051,7 @@ class WebAppActivity : AppCompatActivity() {
                 } catch (e: Exception) { "0" }
             }
 
-            // ── Native audio bridge (called by the JS shim, not by web apps directly) ──
+            // Native audio bridge (used by AUDIO_SHIM_JS)
             @JavascriptInterface fun recStart():  String = nativeRecorder.start()
             @JavascriptInterface fun recStop():   String = nativeRecorder.stop()
             @JavascriptInterface fun recPause():  String = nativeRecorder.pause()
@@ -963,6 +1060,16 @@ class WebAppActivity : AppCompatActivity() {
             @JavascriptInterface fun recWaveform(count: Int): String = nativeRecorder.getWaveform(count)
             @JavascriptInterface fun recIsActive():  Boolean = nativeRecorder.isActive()
             @JavascriptInterface fun recIsPaused():  Boolean = nativeRecorder.isPausedState()
+
+            // Filesystem bridge (used by FS_SHIM_JS → AndroidFS.*)
+            @JavascriptInterface fun fsRead(path: String): String? = fsRead(path)
+            @JavascriptInterface fun fsWrite(path: String, content: String): String = fsWrite(path, content)
+            @JavascriptInterface fun fsReadBase64(path: String): String? = fsReadBase64(path)
+            @JavascriptInterface fun fsWriteBase64(path: String, b64: String): String = fsWriteBase64(path, b64)
+            @JavascriptInterface fun fsDelete(path: String): String = fsDelete(path)
+            @JavascriptInterface fun fsList(path: String): String = fsList(path)
+            @JavascriptInterface fun fsExists(path: String): Boolean = fsExists(path)
+            @JavascriptInterface fun fsMkdir(path: String): String = fsMkdir(path)
         }, "Android")
 
         webView.webViewClient = object : WebViewClient() {
@@ -972,10 +1079,8 @@ class WebAppActivity : AppCompatActivity() {
             }
             override fun onPageFinished(v: WebView, url: String) {
                 progressBar.visibility = View.GONE
-                // Inject the transparent audio shim AFTER page load so web apps
-                // using standard getUserMedia + MediaRecorder get reliable mic
-                // access via the native Android AudioRecord under the hood.
                 v.evaluateJavascript(AUDIO_SHIM_JS, null)
+                v.evaluateJavascript(FS_SHIM_JS,    null)
             }
             override fun onReceivedError(v: WebView, req: WebResourceRequest, err: WebResourceError) {
                 if (req.isForMainFrame) {
@@ -998,12 +1103,8 @@ class WebAppActivity : AppCompatActivity() {
                 if (method != "GET")   return null
                 if (!shouldCache(url)) return null
                 val cacheFile = urlToCacheFile(url)
-                if (cacheFile.exists() && cacheFile.length() > 0) {
-                    android.util.Log.d("NetCache", "HIT  ${cacheFile.name}")
-                    return streamFromDisk(cacheFile, url)
-                }
+                if (cacheFile.exists() && cacheFile.length() > 0) return streamFromDisk(cacheFile, url)
                 return try {
-                    android.util.Log.d("NetCache", "MISS ${url.takeLast(60)}")
                     val conn = openConnection(url, request)
                     val code = conn.responseCode
                     if (code !in 200..299) { conn.disconnect(); return null }
@@ -1020,16 +1121,11 @@ class WebAppActivity : AppCompatActivity() {
                             while (net.read(buf).also { n = it } != -1) fos.write(buf, 0, n)
                         }
                         tmpFile.renameTo(cacheFile)
-                        android.util.Log.d("NetCache", "SAVED ${cacheFile.name} (${cacheFile.length()/1048576}MB)")
                     } catch (e: Exception) {
-                        tmpFile.delete()
-                        android.util.Log.e("NetCache", "Download failed: ${e.message}")
-                        conn.disconnect(); return null
+                        tmpFile.delete(); conn.disconnect(); return null
                     } finally { conn.disconnect() }
                     if (cacheFile.exists() && cacheFile.length() > 0) streamFromDisk(cacheFile, url) else null
-                } catch (e: Exception) {
-                    android.util.Log.e("NetCache", "Intercept error: ${e.message}"); null
-                }
+                } catch (e: Exception) { null }
             }
         }
 
@@ -1085,21 +1181,18 @@ class WebAppActivity : AppCompatActivity() {
                 }
             }
             override fun onGeolocationPermissionsShowPrompt(origin: String, callback: GeolocationPermissions.Callback) {
-                val fine   = android.Manifest.permission.ACCESS_FINE_LOCATION
+                val fine = android.Manifest.permission.ACCESS_FINE_LOCATION
                 val coarse = android.Manifest.permission.ACCESS_COARSE_LOCATION
-                if (checkSelfPermission(fine) == android.content.pm.PackageManager.PERMISSION_GRANTED) {
+                if (checkSelfPermission(fine) == android.content.pm.PackageManager.PERMISSION_GRANTED)
                     callback.invoke(origin, true, false)
-                } else {
+                else {
                     AlertDialog.Builder(this@WebAppActivity)
                         .setTitle("Location Access")
-                        .setMessage("This app wants to access your location.")
                         .setPositiveButton("Allow") { _, _ ->
                             runtimePermsLauncher.launch(arrayOf(fine, coarse))
                             callback.invoke(origin, true, false)
                         }
-                        .setNegativeButton("Deny") { _, _ ->
-                            callback.invoke(origin, false, false)
-                        }.show()
+                        .setNegativeButton("Deny") { _, _ -> callback.invoke(origin, false, false) }.show()
                 }
             }
             override fun onShowFileChooser(webView: WebView, callback: ValueCallback<Array<Uri>>,
