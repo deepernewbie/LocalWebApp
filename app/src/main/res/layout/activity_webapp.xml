@@ -1,19 +1,53 @@
-<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android" xmlns:app="http://schemas.android.com/apk/res-auto" android:layout_width="match_parent" android:layout_height="match_parent" android:orientation="vertical">
-<!-- 
-        AppBar starts hidden (visibility="gone") so the web app occupies
-        the whole screen and its own header/theme is visible. The toolbar
-        is still inflated so we can show it on error or when the user
-        long-presses the webview (see WebAppActivity.kt).
-     -->
-<com.google.android.material.appbar.AppBarLayout android:id="@+id/appBar" android:layout_width="match_parent" android:layout_height="wrap_content" android:visibility="gone">
-<androidx.appcompat.widget.Toolbar android:id="@+id/toolbar" android:layout_width="match_parent" android:layout_height="?attr/actionBarSize" android:background="#1A73E8" app:titleTextColor="#FFFFFF" app:navigationIconTint="#FFFFFF"/>
-<ProgressBar android:id="@+id/progressBar" style="?android:attr/progressBarStyleHorizontal" android:layout_width="match_parent" android:layout_height="3dp" android:max="100" android:progressTint="#4CAF50" android:visibility="gone"/>
-</com.google.android.material.appbar.AppBarLayout>
-<FrameLayout android:layout_width="match_parent" android:layout_height="match_parent">
-<WebView android:id="@+id/webView" android:layout_width="match_parent" android:layout_height="match_parent"/>
-<LinearLayout android:id="@+id/errorView" android:layout_width="match_parent" android:layout_height="match_parent" android:orientation="vertical" android:gravity="center" android:padding="32dp" android:background="#F8F9FA" android:visibility="gone">
-<TextView android:layout_width="wrap_content" android:layout_height="wrap_content" android:text="Failed to load" android:textSize="18sp" android:textColor="#202124" android:textStyle="bold" android:layout_marginBottom="8dp"/>
-<TextView android:id="@+id/errorText" android:layout_width="wrap_content" android:layout_height="wrap_content" android:textSize="13sp" android:textColor="#5F6368" android:gravity="center"/>
-</LinearLayout>
-</FrameLayout>
-</LinearLayout>
+<?xml version="1.0" encoding="utf-8"?>
+<androidx.coordinatorlayout.widget.CoordinatorLayout
+    xmlns:android="http://schemas.android.com/apk/res/android"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent">
+
+    <androidx.appcompat.widget.Toolbar
+        android:id="@+id/toolbar"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:visibility="gone" />
+
+    <FrameLayout
+        android:layout_width="match_parent"
+        android:layout_height="match_parent">
+
+        <WebView
+            android:id="@+id/webView"
+            android:layout_width="match_parent"
+            android:layout_height="match_parent"
+            android:fitsSystemWindows="true" />
+
+        <ProgressBar
+            android:id="@+id/progressBar"
+            style="?android:attr/progressBarStyleHorizontal"
+            android:layout_width="match_parent"
+            android:layout_height="3dp"
+            android:layout_gravity="top"
+            android:visibility="gone" />
+
+        <LinearLayout
+            android:id="@+id/errorView"
+            android:layout_width="match_parent"
+            android:layout_height="match_parent"
+            android:orientation="vertical"
+            android:gravity="center"
+            android:padding="24dp"
+            android:background="#000"
+            android:visibility="gone">
+
+            <TextView
+                android:id="@+id/errorText"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:textColor="#fff"
+                android:textSize="14sp"
+                android:gravity="center" />
+
+        </LinearLayout>
+
+    </FrameLayout>
+
+</androidx.coordinatorlayout.widget.CoordinatorLayout>
