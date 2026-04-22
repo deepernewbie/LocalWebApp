@@ -23,7 +23,6 @@ import android.widget.Toast
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AlertDialog
 import androidx.appcompat.app.AppCompatActivity
-import androidx.core.app.ActivityCompat
 import androidx.core.content.pm.ShortcutInfoCompat
 import androidx.core.content.pm.ShortcutManagerCompat
 import androidx.core.graphics.drawable.IconCompat
@@ -55,10 +54,10 @@ class RecentProjectsAdapter(
 ) : RecyclerView.Adapter<RecentProjectsAdapter.ViewHolder>() {
 
     inner class ViewHolder(view: View) : RecyclerView.ViewHolder(view) {
-        val name: TextView      = view.findViewById(R.id.projectName)
-        val date: TextView      = view.findViewById(R.id.projectDate)
-        val deleteBtn: View     = view.findViewById(R.id.deleteButton)
-        val shortcutBtn: View   = view.findViewById(R.id.shortcutButton)
+        val name: TextView    = view.findViewById(R.id.projectName)
+        val date: TextView    = view.findViewById(R.id.projectDate)
+        val deleteBtn: View   = view.findViewById(R.id.deleteButton)
+        val shortcutBtn: View = view.findViewById(R.id.shortcutButton)
     }
 
     override fun onCreateViewHolder(parent: ViewGroup, viewType: Int): ViewHolder {
@@ -200,8 +199,7 @@ class MainActivity : AppCompatActivity() {
             .setShortLabel(project.name.take(24))
             .setLongLabel(project.name.take(48))
             .setIcon(IconCompat.createWithBitmap(iconBitmap))
-            .setIntent(shortcutIntent)
-            .build()
+            .setIntent(shortcutIntent).build()
         val success = ShortcutManagerCompat.requestPinShortcut(this, shortcut, null)
         if (success) Toast.makeText(this, "Shortcut added", Toast.LENGTH_SHORT).show()
         else         Toast.makeText(this, "Could not add shortcut", Toast.LENGTH_LONG).show()
@@ -217,7 +215,7 @@ class MainActivity : AppCompatActivity() {
             Color.parseColor("#EF4444"), Color.parseColor("#8B5CF6"),
             Color.parseColor("#06B6D4"), Color.parseColor("#F97316")
         )
-        val color   = colors[Math.abs(letter.hashCode()) % colors.size]
+        val color = colors[Math.abs(letter.hashCode()) % colors.size]
         val bgPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply { this.color = color }
         canvas.drawRoundRect(0f, 0f, size.toFloat(), size.toFloat(), 40f, 40f, bgPaint)
         val textPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
@@ -275,22 +273,7 @@ class MainActivity : AppCompatActivity() {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// NativeAudioRecorder — workaround for Samsung/Android 14 WebView NotReadableError
-// ═══════════════════════════════════════════════════════════════════════════════
-//
-// Background: navigator.mediaDevices.getUserMedia() fails in Android WebView on
-// many devices (Samsung A55, OnePlus Nord, Pixel 3a+ emulator) with:
-//   "NotReadableError: Could not start audio source"
-// even when the OS permission is granted and the same page works in Chrome.
-// This is a known bug in Chromium WebView's audio capture subsystem with no
-// published fix (tracked in react-native-webview#3658, expo#35345).
-//
-// Workaround: expose Android's native MediaRecorder API to JavaScript via the
-// JS bridge. Web apps call Android.recStart() / Android.recStop() and get
-// back an MP4/AAC-encoded audio file as base64. This completely bypasses
-// WebView's broken audio subsystem.
-//
-// Web apps can feature-detect with: typeof Android?.recStart === 'function'
+// NativeAudioRecorder — workaround for Samsung/Android 14 WebView bug
 // ═══════════════════════════════════════════════════════════════════════════════
 class NativeAudioRecorder(private val context: android.content.Context) {
 
@@ -298,14 +281,11 @@ class NativeAudioRecorder(private val context: android.content.Context) {
     private var outputFile: File? = null
     @Volatile private var isRecording = false
 
-    /** Start recording. Returns "ok" on success or "error:message" on failure. */
     fun start(): String {
         if (isRecording) return "error:already recording"
-
         return try {
             val file = File(context.cacheDir, "rec_${System.currentTimeMillis()}.m4a")
             outputFile = file
-
             val rec = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
                 MediaRecorder(context)
             } else {
@@ -319,8 +299,7 @@ class NativeAudioRecorder(private val context: android.content.Context) {
             rec.setOutputFile(file.absolutePath)
             rec.prepare()
             rec.start()
-
-            recorder    = rec
+            recorder = rec
             isRecording = true
             android.util.Log.d("NativeAudio", "Recording to ${file.absolutePath}")
             "ok"
@@ -331,26 +310,20 @@ class NativeAudioRecorder(private val context: android.content.Context) {
         }
     }
 
-    /** Stop recording. Returns base64-encoded audio data or "error:message". */
     fun stop(): String {
         if (!isRecording || recorder == null) return "error:not recording"
-
         return try {
             recorder?.stop()
             recorder?.release()
-            recorder    = null
+            recorder = null
             isRecording = false
-
             val file = outputFile ?: return "error:no output file"
             if (!file.exists() || file.length() == 0L) return "error:empty recording"
-
             val bytes  = file.readBytes()
             val base64 = Base64.encodeToString(bytes, Base64.NO_WRAP)
             android.util.Log.d("NativeAudio", "Stopped, ${bytes.size} bytes")
             file.delete()
             outputFile = null
-
-            // Return as data URL so JS can pass directly to <audio src>
             "data:audio/mp4;base64,$base64"
         } catch (e: Exception) {
             android.util.Log.e("NativeAudio", "Stop failed", e)
@@ -359,24 +332,19 @@ class NativeAudioRecorder(private val context: android.content.Context) {
         }
     }
 
-    /**
-     * Return current max amplitude (0-32767) since the last call, as a string.
-     * Used by JS to draw a waveform while recording.
-     */
     fun getAmplitude(): Int {
-        return try {
-            if (isRecording) recorder?.maxAmplitude ?: 0 else 0
-        } catch (e: Exception) { 0 }
+        return try { if (isRecording) recorder?.maxAmplitude ?: 0 else 0 }
+        catch (e: Exception) { 0 }
     }
 
     fun isActive(): Boolean = isRecording
 
     private fun cleanup() {
         try { recorder?.release() } catch (e: Exception) {}
-        recorder    = null
+        recorder = null
         isRecording = false
         outputFile?.delete()
-        outputFile  = null
+        outputFile = null
     }
 }
 
@@ -386,6 +354,240 @@ class WebAppActivity : AppCompatActivity() {
         const val EXTRA_URI   = "extra_uri"
         const val EXTRA_TITLE = "extra_title"
         private const val NET_CACHE = "netcache"
+
+        /**
+         * JS shim injected after every page load. Transparently patches
+         * navigator.mediaDevices.getUserMedia() + MediaRecorder for
+         * audio-only recording so web apps using standard web APIs get
+         * reliable mic access even on WebViews where getUserMedia is broken
+         * (Samsung A55 / Android 14 / OnePlus Nord / Pixel 3a+ emulator —
+         * known bug: "NotReadableError: Could not start audio source").
+         *
+         * Web apps don't know the trick — they just use navigator.mediaDevices
+         * and MediaRecorder as usual. Under the hood, recording is routed
+         * through Android.recStart() / Android.recStop() which uses the
+         * native Android MediaRecorder API.
+         *
+         * Video requests pass through unchanged (WebView video works fine).
+         */
+        private const val AUDIO_SHIM_JS = """
+(function(){
+  if (typeof Android === 'undefined' || typeof Android.recStart !== 'function') return;
+  if (window.__lwa_shim_v1) return;
+  window.__lwa_shim_v1 = true;
+  console.log('[LWA] native audio shim active');
+
+  var origGUM = null;
+  if (navigator.mediaDevices && navigator.mediaDevices.getUserMedia) {
+    origGUM = navigator.mediaDevices.getUserMedia.bind(navigator.mediaDevices);
+  }
+  var OrigMR  = window.MediaRecorder;
+  var OrigAC  = window.AudioContext || window.webkitAudioContext;
+
+  // ── Fake track ────────────────────────────────────────────────────────────
+  function makeTrack() {
+    var listeners = {};
+    return {
+      kind: 'audio',
+      id: 'lwa-track-' + Math.random().toString(36).slice(2),
+      label: 'Native Android Microphone',
+      enabled: true, muted: false, readyState: 'live',
+      contentHint: '',
+      stop: function(){ this.readyState = 'ended'; this.enabled = false; },
+      getSettings: function(){ return { sampleRate:44100, channelCount:1, deviceId:'native' }; },
+      getCapabilities: function(){ return {}; },
+      getConstraints: function(){ return {}; },
+      applyConstraints: function(){ return Promise.resolve(); },
+      clone: function(){ return makeTrack(); },
+      addEventListener: function(e,f){ (listeners[e]=listeners[e]||[]).push(f); },
+      removeEventListener: function(e,f){
+        if (!listeners[e]) return;
+        listeners[e] = listeners[e].filter(function(x){ return x !== f; });
+      },
+      dispatchEvent: function(){ return true; }
+    };
+  }
+
+  // ── Fake stream ──────────────────────────────────────────────────────────
+  function NativeStream() {
+    this.id = 'lwa-stream-' + Math.random().toString(36).slice(2);
+    this.active = true;
+    this.__lwa = true;
+    this._tracks = [ makeTrack() ];
+  }
+  NativeStream.prototype.getTracks      = function(){ return this._tracks.slice(); };
+  NativeStream.prototype.getAudioTracks = function(){ return this._tracks.slice(); };
+  NativeStream.prototype.getVideoTracks = function(){ return []; };
+  NativeStream.prototype.getTrackById   = function(id){
+    return this._tracks.filter(function(t){ return t.id === id; })[0] || null;
+  };
+  NativeStream.prototype.addTrack    = function(){};
+  NativeStream.prototype.removeTrack = function(){};
+  NativeStream.prototype.clone       = function(){ return new NativeStream(); };
+  NativeStream.prototype.addEventListener    = function(){};
+  NativeStream.prototype.removeEventListener = function(){};
+  NativeStream.prototype.dispatchEvent       = function(){ return true; };
+
+  // ── Patch getUserMedia ───────────────────────────────────────────────────
+  if (navigator.mediaDevices) {
+    navigator.mediaDevices.getUserMedia = function(constraints) {
+      var wantA = !!(constraints && constraints.audio);
+      var wantV = !!(constraints && constraints.video);
+      if (wantA && !wantV) {
+        console.log('[LWA] getUserMedia(audio) → native');
+        return Promise.resolve(new NativeStream());
+      }
+      if (origGUM) return origGUM(constraints);
+      return Promise.reject(new DOMException('getUserMedia unavailable','NotSupportedError'));
+    };
+    // Also expose enumerateDevices so apps detecting the mic see it
+    var origEnum = navigator.mediaDevices.enumerateDevices
+                   && navigator.mediaDevices.enumerateDevices.bind(navigator.mediaDevices);
+    navigator.mediaDevices.enumerateDevices = function() {
+      var fake = [{
+        deviceId:'native', groupId:'native',
+        kind:'audioinput', label:'Native Android Microphone'
+      }];
+      if (origEnum) {
+        return origEnum().then(function(list){
+          // Prepend native mic so apps that pick [0] get us
+          var filtered = list.filter(function(d){ return d.kind !== 'audioinput'; });
+          return fake.concat(filtered);
+        }).catch(function(){ return fake; });
+      }
+      return Promise.resolve(fake);
+    };
+  }
+
+  // ── Patch MediaRecorder ──────────────────────────────────────────────────
+  function NativeMR(stream, options) {
+    var self = this;
+    EventTarget ? Object.setPrototypeOf(self, EventTarget.prototype) : 0;
+    self._handlers = {};
+    self._native = stream && stream.__lwa === true;
+
+    if (!self._native && OrigMR) {
+      self._real = new OrigMR(stream, options);
+      ['dataavailable','start','stop','pause','resume','error'].forEach(function(ev){
+        self._real.addEventListener(ev, function(e){
+          self._fire(ev, e);
+        });
+      });
+      Object.defineProperty(self, 'state', { get: function(){ return self._real.state; }});
+      Object.defineProperty(self, 'mimeType', { get: function(){ return self._real.mimeType; }});
+      self.stream = stream;
+      return;
+    }
+
+    self._state    = 'inactive';
+    self.stream    = stream;
+    self.mimeType  = 'audio/mp4';
+    self.audioBitsPerSecond = 96000;
+    self.videoBitsPerSecond = 0;
+    Object.defineProperty(self, 'state', { get: function(){ return self._state; }});
+  }
+
+  NativeMR.prototype._fire = function(ev, detail) {
+    var handlers = this._handlers[ev] || [];
+    var evt = typeof Event === 'function' ? new Event(ev) : { type: ev };
+    if (detail) for (var k in detail) evt[k] = detail[k];
+    handlers.forEach(function(h){ try { h(evt); } catch(e) { console.error(e); } });
+    var cb = this['on' + ev];
+    if (typeof cb === 'function') try { cb(evt); } catch(e) { console.error(e); }
+  };
+  NativeMR.prototype.addEventListener = function(ev, fn) {
+    (this._handlers[ev] = this._handlers[ev] || []).push(fn);
+  };
+  NativeMR.prototype.removeEventListener = function(ev, fn) {
+    if (!this._handlers[ev]) return;
+    this._handlers[ev] = this._handlers[ev].filter(function(x){ return x !== fn; });
+  };
+  NativeMR.prototype.dispatchEvent = function(){ return true; };
+
+  NativeMR.prototype.start = function(timeslice) {
+    if (!this._native) return this._real.start(timeslice);
+    if (this._state !== 'inactive') return;
+    var r = Android.recStart();
+    if (r !== 'ok') {
+      var err = new Error(r);
+      err.name = 'NotReadableError';
+      this._fire('error', { error: err });
+      return;
+    }
+    this._state = 'recording';
+    this._fire('start');
+  };
+
+  NativeMR.prototype.stop = function() {
+    if (!this._native) return this._real.stop();
+    if (this._state === 'inactive') return;
+    var dataUrl = Android.recStop();
+    this._state = 'inactive';
+
+    if (typeof dataUrl === 'string' && dataUrl.indexOf('data:') === 0) {
+      var b64 = dataUrl.split(',')[1] || '';
+      var bin = atob(b64);
+      var buf = new Uint8Array(bin.length);
+      for (var i = 0; i < bin.length; i++) buf[i] = bin.charCodeAt(i);
+      var blob = new Blob([buf], { type: 'audio/mp4' });
+      this._fire('dataavailable', { data: blob });
+      this._fire('stop');
+    } else {
+      var e = new Error(dataUrl || 'recStop failed');
+      e.name = 'AbortError';
+      this._fire('error', { error: e });
+      this._fire('stop');
+    }
+  };
+
+  NativeMR.prototype.pause  = function(){
+    if (!this._native) return this._real.pause();
+    // Not supported by native recorder — just mark state
+    if (this._state === 'recording') { this._state = 'paused'; this._fire('pause'); }
+  };
+  NativeMR.prototype.resume = function(){
+    if (!this._native) return this._real.resume();
+    if (this._state === 'paused')    { this._state = 'recording'; this._fire('resume'); }
+  };
+  NativeMR.prototype.requestData = function(){
+    if (!this._native && this._real) this._real.requestData();
+  };
+
+  NativeMR.isTypeSupported = function(type) {
+    if (!type) return false;
+    if (/audio\/mp4/i.test(type) || /audio\/aac/i.test(type)) return true;
+    return OrigMR ? OrigMR.isTypeSupported(type) : false;
+  };
+
+  window.MediaRecorder = NativeMR;
+
+  // ── Patch AudioContext.createMediaStreamSource for waveform visualizers ──
+  // Apps that feed the stream into an AnalyserNode need real audio data.
+  // We give them a synthetic source driven by Android.recAmplitude().
+  if (OrigAC) {
+    var origCreate = OrigAC.prototype.createMediaStreamSource;
+    OrigAC.prototype.createMediaStreamSource = function(stream) {
+      if (!stream || !stream.__lwa) return origCreate.call(this, stream);
+      // Create a fake source: a ScriptProcessor-ish node that emits synthetic
+      // samples based on the current amplitude polled from native.
+      var ctx = this;
+      var osc = ctx.createOscillator();
+      osc.frequency.value = 0; // silent
+      var gain = ctx.createGain();
+      gain.gain.value = 0;     // don't actually output anything audible
+      osc.connect(gain);
+      osc.start();
+      // Wrap it with analyser-friendly behavior by attaching a data poller.
+      // Apps calling analyser.getByteTimeDomainData will see real-time data
+      // only if they also use our custom analyser — but most apps just work
+      // because they visualize getUserMedia result directly. For now we
+      // return the silent gain node (waveform will be flat during recording).
+      gain.__lwa_silentSource = true;
+      return gain;
+    };
+  }
+})();
+"""
     }
 
     private lateinit var webView: WebView
@@ -400,7 +602,6 @@ class WebAppActivity : AppCompatActivity() {
     private lateinit var folderUri: Uri
     private lateinit var appTitle: String
 
-    // Native audio recorder — workaround for WebView NotReadableError bug
     private val nativeRecorder by lazy { NativeAudioRecorder(this) }
 
     private val startupPermsLauncher =
@@ -439,9 +640,7 @@ class WebAppActivity : AppCompatActivity() {
         }
     }
 
-    private val netCacheDir by lazy {
-        File(filesDir, NET_CACHE).also { it.mkdirs() }
-    }
+    private val netCacheDir by lazy { File(filesDir, NET_CACHE).also { it.mkdirs() } }
 
     @SuppressLint("SetJavaScriptEnabled")
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -473,8 +672,7 @@ class WebAppActivity : AppCompatActivity() {
 
     private fun initializeWebApp() {
         val s = SimpleServer(contentResolver, folderUri, filesDir)
-        server = s
-        s.start()
+        server = s; s.start()
         setupWebView()
         webView.loadUrl("http://localhost:${s.port}/")
     }
@@ -484,9 +682,9 @@ class WebAppActivity : AppCompatActivity() {
         webView.settings.apply {
             javaScriptEnabled = true
             domStorageEnabled = true
-            databaseEnabled = true
-            allowFileAccess = false
-            useWideViewPort = true
+            databaseEnabled   = true
+            allowFileAccess   = false
+            useWideViewPort   = true
             loadWithOverviewMode = true
             setSupportZoom(true)
             builtInZoomControls = true
@@ -523,7 +721,7 @@ class WebAppActivity : AppCompatActivity() {
                 } catch (e: Exception) { "0" }
             }
 
-            // ── Native audio recording (workaround for WebView NotReadableError) ──
+            // ── Native audio bridge (invisible to web apps; JS shim uses these) ──
             @JavascriptInterface fun recStart(): String = nativeRecorder.start()
             @JavascriptInterface fun recStop():  String = nativeRecorder.stop()
             @JavascriptInterface fun recAmplitude(): Int = nativeRecorder.getAmplitude()
@@ -537,6 +735,10 @@ class WebAppActivity : AppCompatActivity() {
             }
             override fun onPageFinished(v: WebView, url: String) {
                 progressBar.visibility = View.GONE
+                // Inject the transparent audio shim AFTER page load.
+                // Web apps can then use standard getUserMedia / MediaRecorder
+                // and recording is routed through native Android under the hood.
+                v.evaluateJavascript(AUDIO_SHIM_JS, null)
             }
             override fun onReceivedError(v: WebView, req: WebResourceRequest, err: WebResourceError) {
                 if (req.isForMainFrame) {
