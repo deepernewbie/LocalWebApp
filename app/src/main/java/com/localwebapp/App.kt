@@ -3,13 +3,11 @@ package com.localwebapp
 import android.annotation.SuppressLint
 import android.content.ContentResolver
 import android.content.Intent
-import android.content.pm.ShortcutInfo
-import android.content.pm.ShortcutManager
 import android.graphics.Bitmap
 import android.graphics.Canvas
 import android.graphics.Color
 import android.graphics.Paint
-import android.graphics.drawable.Icon
+import android.media.MediaRecorder
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
@@ -18,9 +16,7 @@ import android.view.KeyEvent
 import android.view.LayoutInflater
 import android.view.View
 import android.view.ViewGroup
-import android.view.WindowManager
 import android.webkit.*
-import android.widget.ImageButton
 import android.widget.ProgressBar
 import android.widget.TextView
 import android.widget.Toast
@@ -115,8 +111,7 @@ class MainActivity : AppCompatActivity() {
                         .setPositiveButton("Open") { _, _ ->
                             launchWebApp(treeUri, docFile.name ?: "Web App")
                         }
-                        .setNegativeButton("Cancel", null)
-                        .show()
+                        .setNegativeButton("Cancel", null).show()
                 } else {
                     launchWebApp(treeUri, docFile.name ?: "Web App")
                 }
@@ -126,11 +121,6 @@ class MainActivity : AppCompatActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
 
-        // ══════════════════════════════════════════════════════════════════
-        // Handle launch from home screen shortcut
-        // CRITICAL: we must NOT touch any views here since setContentView
-        // hasn't been called yet. Only update prefs then launch.
-        // ══════════════════════════════════════════════════════════════════
         if (intent?.action == "com.localwebapp.OPEN_SHORTCUT") {
             val uri   = intent.getStringExtra("uri")
             val title = intent.getStringExtra("title") ?: "Web App"
@@ -147,7 +137,7 @@ class MainActivity : AppCompatActivity() {
                     val out = JSONArray()
                     filtered.take(20).forEach { out.put(it) }
                     prefs.edit().putString("projects", out.toString()).apply()
-                } catch (e: Exception) { /* non-fatal */ }
+                } catch (e: Exception) { }
 
                 val launchIntent = Intent(this, WebAppActivity::class.java).apply {
                     putExtra(WebAppActivity.EXTRA_URI, uri)
@@ -171,8 +161,7 @@ class MainActivity : AppCompatActivity() {
                 AlertDialog.Builder(this)
                     .setTitle("Remove \"${it.name}\"?")
                     .setPositiveButton("Remove") { _, _ -> removeProject(it.uri) }
-                    .setNegativeButton("Cancel", null)
-                    .show()
+                    .setNegativeButton("Cancel", null).show()
             },
             onShortcut = { createShortcut(it) }
         )
@@ -197,56 +186,40 @@ class MainActivity : AppCompatActivity() {
 
     private fun createShortcut(project: RecentProject) {
         if (!ShortcutManagerCompat.isRequestPinShortcutSupported(this)) {
-            Toast.makeText(this,
-                "Your launcher doesn't support pinning shortcuts",
-                Toast.LENGTH_LONG).show()
+            Toast.makeText(this, "Launcher doesn't support pinning", Toast.LENGTH_LONG).show()
             return
         }
-
         val shortcutIntent = Intent(this, MainActivity::class.java).apply {
             action = "com.localwebapp.OPEN_SHORTCUT"
             putExtra("uri",   project.uri)
             putExtra("title", project.name)
             addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TASK)
         }
-
         val iconBitmap = makeLetterIcon(project.name.firstOrNull()?.uppercase() ?: "W")
-
         val shortcut = ShortcutInfoCompat.Builder(this, "webapp_${project.uri.hashCode()}")
             .setShortLabel(project.name.take(24))
             .setLongLabel(project.name.take(48))
             .setIcon(IconCompat.createWithBitmap(iconBitmap))
             .setIntent(shortcutIntent)
             .build()
-
         val success = ShortcutManagerCompat.requestPinShortcut(this, shortcut, null)
-        if (success) {
-            Toast.makeText(this,
-                "Shortcut added — check your home screen",
-                Toast.LENGTH_SHORT).show()
-        } else {
-            Toast.makeText(this,
-                "Could not add shortcut — drag it from the shortcut menu",
-                Toast.LENGTH_LONG).show()
-        }
+        if (success) Toast.makeText(this, "Shortcut added", Toast.LENGTH_SHORT).show()
+        else         Toast.makeText(this, "Could not add shortcut", Toast.LENGTH_LONG).show()
     }
 
     private fun makeLetterIcon(letter: String): Bitmap {
         val size    = 192
         val bitmap  = Bitmap.createBitmap(size, size, Bitmap.Config.ARGB_8888)
         val canvas  = Canvas(bitmap)
-
-        val colors = listOf(
+        val colors  = listOf(
             Color.parseColor("#6366F1"), Color.parseColor("#EC4899"),
             Color.parseColor("#10B981"), Color.parseColor("#F59E0B"),
             Color.parseColor("#EF4444"), Color.parseColor("#8B5CF6"),
             Color.parseColor("#06B6D4"), Color.parseColor("#F97316")
         )
-        val color = colors[Math.abs(letter.hashCode()) % colors.size]
-
+        val color   = colors[Math.abs(letter.hashCode()) % colors.size]
         val bgPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply { this.color = color }
         canvas.drawRoundRect(0f, 0f, size.toFloat(), size.toFloat(), 40f, 40f, bgPaint)
-
         val textPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
             this.color     = Color.WHITE
             textSize       = 110f
@@ -255,7 +228,6 @@ class MainActivity : AppCompatActivity() {
         }
         val yOffset = (textPaint.descent() + textPaint.ascent()) / 2
         canvas.drawText(letter, size / 2f, size / 2f - yOffset, textPaint)
-
         return bitmap
     }
 
@@ -302,28 +274,147 @@ class MainActivity : AppCompatActivity() {
     }
 }
 
+// ═══════════════════════════════════════════════════════════════════════════════
+// NativeAudioRecorder — workaround for Samsung/Android 14 WebView NotReadableError
+// ═══════════════════════════════════════════════════════════════════════════════
+//
+// Background: navigator.mediaDevices.getUserMedia() fails in Android WebView on
+// many devices (Samsung A55, OnePlus Nord, Pixel 3a+ emulator) with:
+//   "NotReadableError: Could not start audio source"
+// even when the OS permission is granted and the same page works in Chrome.
+// This is a known bug in Chromium WebView's audio capture subsystem with no
+// published fix (tracked in react-native-webview#3658, expo#35345).
+//
+// Workaround: expose Android's native MediaRecorder API to JavaScript via the
+// JS bridge. Web apps call Android.recStart() / Android.recStop() and get
+// back an MP4/AAC-encoded audio file as base64. This completely bypasses
+// WebView's broken audio subsystem.
+//
+// Web apps can feature-detect with: typeof Android?.recStart === 'function'
+// ═══════════════════════════════════════════════════════════════════════════════
+class NativeAudioRecorder(private val context: android.content.Context) {
+
+    private var recorder: MediaRecorder? = null
+    private var outputFile: File? = null
+    @Volatile private var isRecording = false
+
+    /** Start recording. Returns "ok" on success or "error:message" on failure. */
+    fun start(): String {
+        if (isRecording) return "error:already recording"
+
+        return try {
+            val file = File(context.cacheDir, "rec_${System.currentTimeMillis()}.m4a")
+            outputFile = file
+
+            val rec = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+                MediaRecorder(context)
+            } else {
+                @Suppress("DEPRECATION") MediaRecorder()
+            }
+            rec.setAudioSource(MediaRecorder.AudioSource.MIC)
+            rec.setOutputFormat(MediaRecorder.OutputFormat.MPEG_4)
+            rec.setAudioEncoder(MediaRecorder.AudioEncoder.AAC)
+            rec.setAudioSamplingRate(44100)
+            rec.setAudioEncodingBitRate(96000)
+            rec.setOutputFile(file.absolutePath)
+            rec.prepare()
+            rec.start()
+
+            recorder    = rec
+            isRecording = true
+            android.util.Log.d("NativeAudio", "Recording to ${file.absolutePath}")
+            "ok"
+        } catch (e: Exception) {
+            android.util.Log.e("NativeAudio", "Start failed", e)
+            cleanup()
+            "error:${e.message ?: e.javaClass.simpleName}"
+        }
+    }
+
+    /** Stop recording. Returns base64-encoded audio data or "error:message". */
+    fun stop(): String {
+        if (!isRecording || recorder == null) return "error:not recording"
+
+        return try {
+            recorder?.stop()
+            recorder?.release()
+            recorder    = null
+            isRecording = false
+
+            val file = outputFile ?: return "error:no output file"
+            if (!file.exists() || file.length() == 0L) return "error:empty recording"
+
+            val bytes  = file.readBytes()
+            val base64 = Base64.encodeToString(bytes, Base64.NO_WRAP)
+            android.util.Log.d("NativeAudio", "Stopped, ${bytes.size} bytes")
+            file.delete()
+            outputFile = null
+
+            // Return as data URL so JS can pass directly to <audio src>
+            "data:audio/mp4;base64,$base64"
+        } catch (e: Exception) {
+            android.util.Log.e("NativeAudio", "Stop failed", e)
+            cleanup()
+            "error:${e.message ?: e.javaClass.simpleName}"
+        }
+    }
+
+    /**
+     * Return current max amplitude (0-32767) since the last call, as a string.
+     * Used by JS to draw a waveform while recording.
+     */
+    fun getAmplitude(): Int {
+        return try {
+            if (isRecording) recorder?.maxAmplitude ?: 0 else 0
+        } catch (e: Exception) { 0 }
+    }
+
+    fun isActive(): Boolean = isRecording
+
+    private fun cleanup() {
+        try { recorder?.release() } catch (e: Exception) {}
+        recorder    = null
+        isRecording = false
+        outputFile?.delete()
+        outputFile  = null
+    }
+}
+
 class WebAppActivity : AppCompatActivity() {
 
     companion object {
-        const val EXTRA_URI = "extra_uri"
+        const val EXTRA_URI   = "extra_uri"
         const val EXTRA_TITLE = "extra_title"
         private const val NET_CACHE = "netcache"
-        private const val STARTUP_PERM_REQ = 9001
     }
 
     private lateinit var webView: WebView
     private lateinit var progressBar: ProgressBar
     private lateinit var errorView: View
     private lateinit var errorText: TextView
+
     private var server: SimpleServer? = null
     private var pendingPermissionRequest: PermissionRequest? = null
     private var filePathCallback: ValueCallback<Array<Uri>>? = null
 
-    private val permissionLauncher =
+    private lateinit var folderUri: Uri
+    private lateinit var appTitle: String
+
+    // Native audio recorder — workaround for WebView NotReadableError bug
+    private val nativeRecorder by lazy { NativeAudioRecorder(this) }
+
+    private val startupPermsLauncher =
+        registerForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) { _ ->
+            initializeWebApp()
+        }
+
+    private val runtimePermsLauncher =
         registerForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) { results ->
             val allGranted = results.values.all { it }
-            if (allGranted) pendingPermissionRequest?.grant(pendingPermissionRequest!!.resources)
-            else pendingPermissionRequest?.deny()
+            val pending    = pendingPermissionRequest
+            if (pending != null) {
+                if (allGranted) pending.grant(pending.resources) else pending.deny()
+            }
             pendingPermissionRequest = null
         }
 
@@ -343,7 +434,7 @@ class WebAppActivity : AppCompatActivity() {
     private val imageCaptureCallback by lazy {
         registerForActivityResult(ActivityResultContracts.TakePicture()) { success ->
             if (success) filePathCallback?.onReceiveValue(arrayOf(imageCaptureUri))
-            else filePathCallback?.onReceiveValue(null)
+            else         filePathCallback?.onReceiveValue(null)
             filePathCallback = null
         }
     }
@@ -355,46 +446,35 @@ class WebAppActivity : AppCompatActivity() {
     @SuppressLint("SetJavaScriptEnabled")
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-
-        // Hide action bar — web app owns the full screen
         supportActionBar?.hide()
-
         setContentView(R.layout.activity_webapp)
 
-        val uriStr    = intent.getStringExtra(EXTRA_URI) ?: run { finish(); return }
-        val title     = intent.getStringExtra(EXTRA_TITLE) ?: "Web App"
-        val folderUri = Uri.parse(uriStr)
+        val uriStr = intent.getStringExtra(EXTRA_URI) ?: run { finish(); return }
+        folderUri  = Uri.parse(uriStr)
+        appTitle   = intent.getStringExtra(EXTRA_TITLE) ?: "Web App"
 
         webView     = findViewById(R.id.webView)
         progressBar = findViewById(R.id.progressBar)
         errorView   = findViewById(R.id.errorView)
         errorText   = findViewById(R.id.errorText)
+        progressBar.visibility = View.VISIBLE
 
-        // ══════════════════════════════════════════════════════════════════
-        // Pre-request mic + camera permissions at Activity start.
-        // This primes Android's audio policy manager so the WebView later
-        // gets a clean audio handle. Without this, WebView mic requests may
-        // succeed on permission check but fail with NotReadableError because
-        // the audio device isn't properly allocated to our process.
-        // ══════════════════════════════════════════════════════════════════
         val neededPerms = mutableListOf<String>()
         if (checkSelfPermission(android.Manifest.permission.RECORD_AUDIO)
-            != android.content.pm.PackageManager.PERMISSION_GRANTED) {
+            != android.content.pm.PackageManager.PERMISSION_GRANTED)
             neededPerms.add(android.Manifest.permission.RECORD_AUDIO)
-        }
         if (checkSelfPermission(android.Manifest.permission.CAMERA)
-            != android.content.pm.PackageManager.PERMISSION_GRANTED) {
+            != android.content.pm.PackageManager.PERMISSION_GRANTED)
             neededPerms.add(android.Manifest.permission.CAMERA)
-        }
-        if (neededPerms.isNotEmpty()) {
-            ActivityCompat.requestPermissions(
-                this, neededPerms.toTypedArray(), STARTUP_PERM_REQ)
-        }
 
+        if (neededPerms.isEmpty()) initializeWebApp()
+        else startupPermsLauncher.launch(neededPerms.toTypedArray())
+    }
+
+    private fun initializeWebApp() {
         val s = SimpleServer(contentResolver, folderUri, filesDir)
         server = s
         s.start()
-
         setupWebView()
         webView.loadUrl("http://localhost:${s.port}/")
     }
@@ -416,12 +496,10 @@ class WebAppActivity : AppCompatActivity() {
         }
 
         webView.addJavascriptInterface(object : Any() {
-            @JavascriptInterface
-            fun toast(msg: String) = runOnUiThread {
+            @JavascriptInterface fun toast(msg: String) = runOnUiThread {
                 Toast.makeText(this@WebAppActivity, msg, Toast.LENGTH_SHORT).show()
             }
-            @JavascriptInterface fun log(msg: String) =
-                android.util.Log.d("WebApp", msg)
+            @JavascriptInterface fun log(msg: String) = android.util.Log.d("WebApp", msg)
             @JavascriptInterface fun isNativeApp() = true
             @JavascriptInterface fun getPlatform() = "android"
             @JavascriptInterface fun getAppVersion(): String =
@@ -429,20 +507,14 @@ class WebAppActivity : AppCompatActivity() {
             @JavascriptInterface fun share(text: String) = runOnUiThread {
                 startActivity(Intent.createChooser(
                     Intent(Intent.ACTION_SEND).apply {
-                        type = "text/plain"
-                        putExtra(Intent.EXTRA_TEXT, text)
-                    }, "Share"
-                ))
+                        type = "text/plain"; putExtra(Intent.EXTRA_TEXT, text)
+                    }, "Share"))
             }
             @JavascriptInterface fun vibrate() = runOnUiThread {
-                val v = getSystemService(android.content.Context.VIBRATOR_SERVICE)
-                        as android.os.Vibrator
-                if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.O) {
-                    v.vibrate(android.os.VibrationEffect.createOneShot(
-                        100, android.os.VibrationEffect.DEFAULT_AMPLITUDE))
-                } else {
-                    @Suppress("DEPRECATION") v.vibrate(100)
-                }
+                val v = getSystemService(android.content.Context.VIBRATOR_SERVICE) as android.os.Vibrator
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O)
+                    v.vibrate(android.os.VibrationEffect.createOneShot(100, android.os.VibrationEffect.DEFAULT_AMPLITUDE))
+                else @Suppress("DEPRECATION") v.vibrate(100)
             }
             @JavascriptInterface fun getFreeMB(): String {
                 return try {
@@ -450,10 +522,15 @@ class WebAppActivity : AppCompatActivity() {
                     (stat.availableBlocksLong * stat.blockSizeLong / 1048576).toString()
                 } catch (e: Exception) { "0" }
             }
+
+            // ── Native audio recording (workaround for WebView NotReadableError) ──
+            @JavascriptInterface fun recStart(): String = nativeRecorder.start()
+            @JavascriptInterface fun recStop():  String = nativeRecorder.stop()
+            @JavascriptInterface fun recAmplitude(): Int = nativeRecorder.getAmplitude()
+            @JavascriptInterface fun recIsActive(): Boolean = nativeRecorder.isActive()
         }, "Android")
 
         webView.webViewClient = object : WebViewClient() {
-
             override fun onPageStarted(v: WebView, url: String, f: Bitmap?) {
                 progressBar.visibility = View.VISIBLE
                 errorView.visibility   = View.GONE
@@ -461,93 +538,58 @@ class WebAppActivity : AppCompatActivity() {
             override fun onPageFinished(v: WebView, url: String) {
                 progressBar.visibility = View.GONE
             }
-            override fun onReceivedError(
-                v: WebView, req: WebResourceRequest, err: WebResourceError
-            ) {
+            override fun onReceivedError(v: WebView, req: WebResourceRequest, err: WebResourceError) {
                 if (req.isForMainFrame) {
                     progressBar.visibility = View.GONE
                     errorView.visibility   = View.VISIBLE
                     errorText.text         = "Error: ${err.description}"
                 }
             }
-            override fun shouldOverrideUrlLoading(
-                v: WebView, req: WebResourceRequest
-            ): Boolean {
+            override fun shouldOverrideUrlLoading(v: WebView, req: WebResourceRequest): Boolean {
                 val url = req.url.toString()
                 if (url.startsWith("http://localhost")) return false
                 if (url.startsWith("mailto:") || url.startsWith("tel:")) {
-                    startActivity(Intent(Intent.ACTION_VIEW, req.url))
-                    return true
+                    startActivity(Intent(Intent.ACTION_VIEW, req.url)); return true
                 }
-                startActivity(Intent(Intent.ACTION_VIEW, req.url))
-                return true
+                startActivity(Intent(Intent.ACTION_VIEW, req.url)); return true
             }
-
-            override fun shouldInterceptRequest(
-                view: WebView,
-                request: WebResourceRequest
-            ): WebResourceResponse? {
+            override fun shouldInterceptRequest(view: WebView, request: WebResourceRequest): WebResourceResponse? {
                 val url    = request.url.toString()
                 val method = request.method ?: "GET"
-                if (method != "GET")     return null
-                if (!shouldCache(url))   return null
-
+                if (method != "GET")   return null
+                if (!shouldCache(url)) return null
                 val cacheFile = urlToCacheFile(url)
-
                 if (cacheFile.exists() && cacheFile.length() > 0) {
                     android.util.Log.d("NetCache", "HIT  ${cacheFile.name}")
                     return streamFromDisk(cacheFile, url)
                 }
-
                 return try {
                     android.util.Log.d("NetCache", "MISS ${url.takeLast(60)}")
-
                     val conn = openConnection(url, request)
                     val code = conn.responseCode
-
-                    if (code !in 200..299) {
-                        conn.disconnect()
-                        return null
-                    }
-
+                    if (code !in 200..299) { conn.disconnect(); return null }
                     val contentType = conn.contentType ?: guessMime(url)
-                    if (contentType.contains("text/html")) {
-                        conn.disconnect()
-                        return null
-                    }
-
+                    if (contentType.contains("text/html")) { conn.disconnect(); return null }
                     cacheFile.parentFile?.mkdirs()
                     val tmpFile = File(cacheFile.parent, "${cacheFile.name}.tmp")
                     tmpFile.delete()
-
                     val buf = ByteArray(512 * 1024)
                     try {
                         FileOutputStream(tmpFile).use { fos ->
                             val net = conn.inputStream
                             var n: Int
-                            while (net.read(buf).also { n = it } != -1) {
-                                fos.write(buf, 0, n)
-                            }
+                            while (net.read(buf).also { n = it } != -1) fos.write(buf, 0, n)
                         }
                         tmpFile.renameTo(cacheFile)
-                        android.util.Log.d("NetCache",
-                            "SAVED ${cacheFile.name} (${cacheFile.length()/1048576}MB)")
+                        android.util.Log.d("NetCache", "SAVED ${cacheFile.name} (${cacheFile.length()/1048576}MB)")
                     } catch (e: Exception) {
                         tmpFile.delete()
                         android.util.Log.e("NetCache", "Download failed: ${e.message}")
-                        conn.disconnect()
-                        return null
-                    } finally {
-                        conn.disconnect()
-                    }
-
-                    if (cacheFile.exists() && cacheFile.length() > 0) {
-                        streamFromDisk(cacheFile, url)
-                    } else null
-
+                        conn.disconnect(); return null
+                    } finally { conn.disconnect() }
+                    if (cacheFile.exists() && cacheFile.length() > 0) streamFromDisk(cacheFile, url) else null
                 } catch (e: Exception) {
-                    android.util.Log.e("NetCache", "Intercept error: ${e.message}")
-                    null
+                    android.util.Log.e("NetCache", "Intercept error: ${e.message}"); null
                 }
             }
         }
@@ -562,33 +604,24 @@ class WebAppActivity : AppCompatActivity() {
                     "[${m.messageLevel()}] ${m.message()} (line ${m.lineNumber()})")
                 return true
             }
-            override fun onJsAlert(
-                view: WebView, url: String, message: String, result: JsResult
-            ): Boolean {
-                AlertDialog.Builder(this@WebAppActivity)
-                    .setMessage(message)
+            override fun onJsAlert(view: WebView, url: String, message: String, result: JsResult): Boolean {
+                AlertDialog.Builder(this@WebAppActivity).setMessage(message)
                     .setPositiveButton("OK") { _, _ -> result.confirm() }
                     .setOnCancelListener { result.cancel() }.show()
                 return true
             }
-            override fun onJsConfirm(
-                view: WebView, url: String, message: String, result: JsResult
-            ): Boolean {
-                AlertDialog.Builder(this@WebAppActivity)
-                    .setMessage(message)
+            override fun onJsConfirm(view: WebView, url: String, message: String, result: JsResult): Boolean {
+                AlertDialog.Builder(this@WebAppActivity).setMessage(message)
                     .setPositiveButton("OK") { _, _ -> result.confirm() }
                     .setNegativeButton("Cancel") { _, _ -> result.cancel() }
                     .setOnCancelListener { result.cancel() }.show()
                 return true
             }
-            override fun onJsPrompt(
-                view: WebView, url: String, message: String,
-                defaultValue: String?, result: JsPromptResult
-            ): Boolean {
+            override fun onJsPrompt(view: WebView, url: String, message: String,
+                                     defaultValue: String?, result: JsPromptResult): Boolean {
                 val input = android.widget.EditText(this@WebAppActivity)
                 input.setText(defaultValue ?: "")
-                AlertDialog.Builder(this@WebAppActivity)
-                    .setMessage(message).setView(input)
+                AlertDialog.Builder(this@WebAppActivity).setMessage(message).setView(input)
                     .setPositiveButton("OK") { _, _ -> result.confirm(input.text.toString()) }
                     .setNegativeButton("Cancel") { _, _ -> result.cancel() }
                     .setOnCancelListener { result.cancel() }.show()
@@ -596,48 +629,33 @@ class WebAppActivity : AppCompatActivity() {
             }
             override fun onPermissionRequest(request: PermissionRequest) {
                 runOnUiThread {
-                    android.util.Log.d("WebApp-Perm",
-                        "Permission requested: ${request.resources.joinToString()}")
                     val perms = mutableListOf<String>()
                     if (request.resources.contains(PermissionRequest.RESOURCE_VIDEO_CAPTURE))
                         perms.add(android.Manifest.permission.CAMERA)
                     if (request.resources.contains(PermissionRequest.RESOURCE_AUDIO_CAPTURE))
                         perms.add(android.Manifest.permission.RECORD_AUDIO)
-
-                    if (perms.isEmpty()) {
-                        request.grant(request.resources)
-                        return@runOnUiThread
-                    }
-
+                    if (perms.isEmpty()) { request.grant(request.resources); return@runOnUiThread }
                     val allGranted = perms.all {
-                        checkSelfPermission(it) ==
-                            android.content.pm.PackageManager.PERMISSION_GRANTED
+                        checkSelfPermission(it) == android.content.pm.PackageManager.PERMISSION_GRANTED
                     }
-                    android.util.Log.d("WebApp-Perm",
-                        "OS perms granted=$allGranted, needed=${perms.joinToString()}")
-
-                    if (allGranted) {
-                        request.grant(request.resources)
-                    } else {
+                    if (allGranted) request.grant(request.resources)
+                    else {
                         pendingPermissionRequest = request
-                        permissionLauncher.launch(perms.toTypedArray())
+                        runtimePermsLauncher.launch(perms.toTypedArray())
                     }
                 }
             }
-            override fun onGeolocationPermissionsShowPrompt(
-                origin: String, callback: GeolocationPermissions.Callback
-            ) {
+            override fun onGeolocationPermissionsShowPrompt(origin: String, callback: GeolocationPermissions.Callback) {
                 val fine   = android.Manifest.permission.ACCESS_FINE_LOCATION
                 val coarse = android.Manifest.permission.ACCESS_COARSE_LOCATION
-                if (checkSelfPermission(fine) ==
-                    android.content.pm.PackageManager.PERMISSION_GRANTED) {
+                if (checkSelfPermission(fine) == android.content.pm.PackageManager.PERMISSION_GRANTED) {
                     callback.invoke(origin, true, false)
                 } else {
                     AlertDialog.Builder(this@WebAppActivity)
                         .setTitle("Location Access")
                         .setMessage("This app wants to access your location.")
                         .setPositiveButton("Allow") { _, _ ->
-                            permissionLauncher.launch(arrayOf(fine, coarse))
+                            runtimePermsLauncher.launch(arrayOf(fine, coarse))
                             callback.invoke(origin, true, false)
                         }
                         .setNegativeButton("Deny") { _, _ ->
@@ -645,10 +663,8 @@ class WebAppActivity : AppCompatActivity() {
                         }.show()
                 }
             }
-            override fun onShowFileChooser(
-                webView: WebView, callback: ValueCallback<Array<Uri>>,
-                params: FileChooserParams
-            ): Boolean {
+            override fun onShowFileChooser(webView: WebView, callback: ValueCallback<Array<Uri>>,
+                                            params: FileChooserParams): Boolean {
                 filePathCallback?.onReceiveValue(null)
                 filePathCallback = callback
                 val acceptTypes = params.acceptTypes.joinToString(",")
@@ -658,26 +674,20 @@ class WebAppActivity : AppCompatActivity() {
                     catch (e: Exception) {}
                 }
                 if (isImage) {
-                    AlertDialog.Builder(this@WebAppActivity)
-                        .setTitle("Get Image")
+                    AlertDialog.Builder(this@WebAppActivity).setTitle("Get Image")
                         .setItems(arrayOf("Take Photo", "Choose from Gallery")) { _, which ->
                             if (which == 0) {
                                 try { imageCaptureCallback.launch(imageCaptureUri) }
                                 catch (e: Exception) {
-                                    filePathCallback?.onReceiveValue(null)
-                                    filePathCallback = null
+                                    filePathCallback?.onReceiveValue(null); filePathCallback = null
                                 }
                             } else fileChooserLauncher.launch("image/*")
-                        }
-                        .setOnCancelListener {
-                            filePathCallback?.onReceiveValue(null)
-                            filePathCallback = null
+                        }.setOnCancelListener {
+                            filePathCallback?.onReceiveValue(null); filePathCallback = null
                         }.show()
                 } else {
                     fileChooserLauncher.launch(
-                        if (acceptTypes.isNotEmpty() && acceptTypes != "*/*")
-                            acceptTypes else "*/*"
-                    )
+                        if (acceptTypes.isNotEmpty() && acceptTypes != "*/*") acceptTypes else "*/*")
                 }
                 return true
             }
@@ -700,8 +710,6 @@ class WebAppActivity : AppCompatActivity() {
             }
         }
     }
-
-    // ── Cache helpers ─────────────────────────────────────────────────────────
 
     private fun streamFromDisk(file: File, url: String): WebResourceResponse {
         return WebResourceResponse(
@@ -730,15 +738,11 @@ class WebAppActivity : AppCompatActivity() {
 
     private fun shouldCache(url: String): Boolean {
         val lower = url.lowercase()
-        val cacheExts = listOf(
-            ".onnx", ".wasm", ".bin", ".ot", ".gguf",
-            ".safetensors", ".pt", ".pth", ".tflite"
-        )
+        val cacheExts = listOf(".onnx", ".wasm", ".bin", ".ot", ".gguf",
+            ".safetensors", ".pt", ".pth", ".tflite")
         if (cacheExts.any { lower.contains(it) }) return true
-        val cacheDomains = listOf(
-            "huggingface.co", "cdn-lfs", "jsdelivr.net",
-            "esm.run", "cdn.jsdelivr.net"
-        )
+        val cacheDomains = listOf("huggingface.co", "cdn-lfs", "jsdelivr.net",
+            "esm.run", "cdn.jsdelivr.net")
         if (cacheDomains.any { lower.contains(it) }) {
             if (lower.endsWith(".html")) return false
             return true
@@ -748,8 +752,7 @@ class WebAppActivity : AppCompatActivity() {
 
     private fun urlToCacheFile(url: String): File {
         val uri     = Uri.parse(url)
-        val lastSeg = uri.lastPathSegment
-            ?.replace(Regex("[^a-zA-Z0-9._-]"), "_") ?: "file"
+        val lastSeg = uri.lastPathSegment?.replace(Regex("[^a-zA-Z0-9._-]"), "_") ?: "file"
         val hash    = url.hashCode().toLong() and 0xFFFFFFFFL
         val name    = "${hash}_${lastSeg}".take(120)
         val host    = uri.host?.replace(".", "_")?.take(30) ?: "misc"
@@ -777,7 +780,10 @@ class WebAppActivity : AppCompatActivity() {
         return super.onKeyDown(keyCode, event)
     }
     override fun onDestroy() {
-        super.onDestroy(); server?.stop(); webView.destroy()
+        super.onDestroy()
+        if (nativeRecorder.isActive()) nativeRecorder.stop()
+        server?.stop()
+        webView.destroy()
     }
     override fun onPause()  { super.onPause();  webView.onPause()  }
     override fun onResume() { super.onResume(); webView.onResume() }
@@ -801,9 +807,7 @@ class SimpleServer(
             while (active) {
                 try {
                     val client = serverSocket!!.accept()
-                    executor.submit {
-                        try { handle(client) } finally { client.close() }
-                    }
+                    executor.submit { try { handle(client) } finally { client.close() } }
                 } catch (e: Exception) { if (active) e.printStackTrace() }
             }
         }
@@ -827,8 +831,7 @@ class SimpleServer(
             if (h.isBlank()) break
         } while (true)
         if (path == "/" || path.isEmpty()) path = "/index.html"
-        val segments = path.trimStart('/').split("/")
-            .filter { it.isNotEmpty() && it != ".." }
+        val segments = path.trimStart('/').split("/").filter { it.isNotEmpty() && it != ".." }
         val file = resolve(segments)
         when {
             file == null || !file.exists() -> {
@@ -873,9 +876,7 @@ class SimpleServer(
         out.write(body); out.flush()
     }
 
-    private fun getMime(name: String) = when (
-        name.substringAfterLast('.', "").lowercase()
-    ) {
+    private fun getMime(name: String) = when (name.substringAfterLast('.', "").lowercase()) {
         "html", "htm" -> "text/html; charset=utf-8"
         "css"         -> "text/css; charset=utf-8"
         "js", "mjs"   -> "application/javascript; charset=utf-8"
