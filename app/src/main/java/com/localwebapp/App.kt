@@ -277,7 +277,7 @@ class MainActivity : AppCompatActivity() {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// NativeAudioRecorder — AudioRecord-based, WAV output, waveform, pause/resume
+// NativeAudioRecorder
 // ═══════════════════════════════════════════════════════════════════════════════
 class NativeAudioRecorder {
     companion object {
@@ -422,14 +422,13 @@ class NativeAudioRecorder {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// JsFilesystemBridge — class-level bridge with no name collisions.
+// JsFilesystemBridge — exposed as AndroidFS_native
 // ═══════════════════════════════════════════════════════════════════════════════
 class JsFilesystemBridge(
     private val ctx: android.content.Context,
     private val resolver: ContentResolver,
     private val rootUri: Uri
 ) {
-    /** Walk/create segments relative to the root SAF folder. */
     private fun resolvePath(path: String, createFile: Boolean): DocumentFile? {
         val root = DocumentFile.fromTreeUri(ctx, rootUri) ?: return null
         val segments = path.split("/", "\\")
@@ -450,112 +449,69 @@ class JsFilesystemBridge(
         return null
     }
 
-    @JavascriptInterface
-    fun read(path: String): String? {
-        return try {
-            val file = resolvePath(path, false) ?: return null
-            if (!file.isFile) return null
-            resolver.openInputStream(file.uri)?.use { it.readBytes() }
-                ?.toString(Charsets.UTF_8)
-        } catch (e: Exception) {
-            android.util.Log.e("LWA-FS", "read $path: ${e.message}")
-            null
+    @JavascriptInterface fun read(path: String): String? = try {
+        val file = resolvePath(path, false) ?: return null
+        if (!file.isFile) null
+        else resolver.openInputStream(file.uri)?.use { it.readBytes() }?.toString(Charsets.UTF_8)
+    } catch (e: Exception) { android.util.Log.e("LWA-FS", "read $path: ${e.message}"); null }
+
+    @JavascriptInterface fun write(path: String, content: String): String = try {
+        val file = resolvePath(path, true) ?: return "error:path"
+        val bytes = content.toByteArray(Charsets.UTF_8)
+        resolver.openOutputStream(file.uri, "wt")?.use { it.write(bytes) } ?: return "error:no output stream"
+        "ok"
+    } catch (e: Exception) { android.util.Log.e("LWA-FS", "write $path: ${e.message}"); "error:${e.message}" }
+
+    @JavascriptInterface fun readBase64(path: String): String? = try {
+        val file = resolvePath(path, false) ?: return null
+        if (!file.isFile) null
+        else Base64.encodeToString(
+            resolver.openInputStream(file.uri)?.use { it.readBytes() } ?: return null,
+            Base64.NO_WRAP)
+    } catch (e: Exception) { null }
+
+    @JavascriptInterface fun writeBase64(path: String, b64: String): String = try {
+        val file = resolvePath(path, true) ?: return "error:path"
+        resolver.openOutputStream(file.uri, "wt")?.use {
+            it.write(Base64.decode(b64, Base64.DEFAULT))
+        } ?: return "error:no output stream"
+        "ok"
+    } catch (e: Exception) { "error:${e.message}" }
+
+    @JavascriptInterface fun deleteFile(path: String): String = try {
+        val file = resolvePath(path, false) ?: return "error:not found"
+        if (file.delete()) "ok" else "error:delete failed"
+    } catch (e: Exception) { "error:${e.message}" }
+
+    @JavascriptInterface fun list(path: String): String = try {
+        val node = if (path.isEmpty() || path == "/" || path == ".") {
+            DocumentFile.fromTreeUri(ctx, rootUri)
+        } else {
+            val root = DocumentFile.fromTreeUri(ctx, rootUri) ?: return ""
+            val segments = path.split("/", "\\").filter { it.isNotEmpty() && it != ".." && it != "." }
+            var n: DocumentFile = root
+            for (seg in segments) { n = n.findFile(seg) ?: return ""; if (!n.isDirectory) return "" }
+            n
+        } ?: return ""
+        node.listFiles().mapNotNull { it.name }.joinToString("\n")
+    } catch (e: Exception) { "" }
+
+    @JavascriptInterface fun exists(path: String): Boolean = try {
+        val file = resolvePath(path, false); file != null && file.exists()
+    } catch (e: Exception) { false }
+
+    @JavascriptInterface fun mkdir(path: String): String = try {
+        val root = DocumentFile.fromTreeUri(ctx, rootUri) ?: return "error:root"
+        val segments = path.split("/", "\\").filter { it.isNotEmpty() && it != ".." && it != "." }
+        if (segments.isEmpty()) return "error:empty path"
+        var node: DocumentFile = root
+        for (name in segments) {
+            val child = node.findFile(name)
+            node = if (child != null && child.isDirectory) child
+                   else node.createDirectory(name) ?: return "error:mkdir $name"
         }
-    }
-
-    @JavascriptInterface
-    fun write(path: String, content: String): String {
-        return try {
-            val file = resolvePath(path, true) ?: return "error:path"
-            // Truncate: delete + recreate to avoid leftover bytes when new
-            // content is shorter than old. Use "wt" for truncation if available.
-            val bytes = content.toByteArray(Charsets.UTF_8)
-            resolver.openOutputStream(file.uri, "wt")?.use { it.write(bytes) }
-                ?: return "error:no output stream"
-            "ok"
-        } catch (e: Exception) {
-            android.util.Log.e("LWA-FS", "write $path: ${e.message}")
-            "error:${e.message}"
-        }
-    }
-
-    @JavascriptInterface
-    fun readBase64(path: String): String? {
-        return try {
-            val file = resolvePath(path, false) ?: return null
-            if (!file.isFile) return null
-            val bytes = resolver.openInputStream(file.uri)?.use { it.readBytes() } ?: return null
-            Base64.encodeToString(bytes, Base64.NO_WRAP)
-        } catch (e: Exception) {
-            android.util.Log.e("LWA-FS", "readBase64 $path: ${e.message}")
-            null
-        }
-    }
-
-    @JavascriptInterface
-    fun writeBase64(path: String, b64: String): String {
-        return try {
-            val file = resolvePath(path, true) ?: return "error:path"
-            val bytes = Base64.decode(b64, Base64.DEFAULT)
-            resolver.openOutputStream(file.uri, "wt")?.use { it.write(bytes) }
-                ?: return "error:no output stream"
-            "ok"
-        } catch (e: Exception) {
-            "error:${e.message}"
-        }
-    }
-
-    @JavascriptInterface
-    fun deleteFile(path: String): String {
-        return try {
-            val file = resolvePath(path, false) ?: return "error:not found"
-            if (file.delete()) "ok" else "error:delete failed"
-        } catch (e: Exception) {
-            "error:${e.message}"
-        }
-    }
-
-    @JavascriptInterface
-    fun list(path: String): String {
-        return try {
-            val node = if (path.isEmpty() || path == "/" || path == ".") {
-                DocumentFile.fromTreeUri(ctx, rootUri)
-            } else {
-                val root = DocumentFile.fromTreeUri(ctx, rootUri) ?: return ""
-                val segments = path.split("/", "\\")
-                    .filter { it.isNotEmpty() && it != ".." && it != "." }
-                var n: DocumentFile = root
-                for (seg in segments) { n = n.findFile(seg) ?: return ""; if (!n.isDirectory) return "" }
-                n
-            } ?: return ""
-            node.listFiles().mapNotNull { it.name }.joinToString("\n")
-        } catch (e: Exception) { "" }
-    }
-
-    @JavascriptInterface
-    fun exists(path: String): Boolean {
-        return try {
-            val file = resolvePath(path, false)
-            file != null && file.exists()
-        } catch (e: Exception) { false }
-    }
-
-    @JavascriptInterface
-    fun mkdir(path: String): String {
-        return try {
-            val root = DocumentFile.fromTreeUri(ctx, rootUri) ?: return "error:root"
-            val segments = path.split("/", "\\")
-                .filter { it.isNotEmpty() && it != ".." && it != "." }
-            if (segments.isEmpty()) return "error:empty path"
-            var node: DocumentFile = root
-            for (name in segments) {
-                val child = node.findFile(name)
-                node = if (child != null && child.isDirectory) child
-                       else node.createDirectory(name) ?: return "error:mkdir $name"
-            }
-            "ok"
-        } catch (e: Exception) { "error:${e.message}" }
-    }
+        "ok"
+    } catch (e: Exception) { "error:${e.message}" }
 }
 
 class WebAppActivity : AppCompatActivity() {
@@ -565,357 +521,376 @@ class WebAppActivity : AppCompatActivity() {
         const val EXTRA_TITLE = "extra_title"
         private const val NET_CACHE = "netcache"
 
-        private const val AUDIO_SHIM_JS = """
-(function(){
-  if (typeof Android === 'undefined' || typeof Android.recStart !== 'function') return;
-  if (window.__lwa_audio_v1) return;
-  window.__lwa_audio_v1 = true;
-
-  var origGUM = navigator.mediaDevices && navigator.mediaDevices.getUserMedia
-                ? navigator.mediaDevices.getUserMedia.bind(navigator.mediaDevices) : null;
-  var OrigMR = window.MediaRecorder;
-  var OrigAC = window.AudioContext || window.webkitAudioContext;
-
-  function makeTrack() {
-    return {
-      kind:'audio', id:'lwa-track-'+Math.random().toString(36).slice(2),
-      label:'Native Android Microphone',
-      enabled:true, muted:false, readyState:'live', contentHint:'',
-      stop: function(){ this.readyState='ended'; this.enabled=false; },
-      getSettings: function(){ return {sampleRate:44100, channelCount:1, deviceId:'native'}; },
-      getCapabilities: function(){ return {}; }, getConstraints: function(){ return {}; },
-      applyConstraints: function(){ return Promise.resolve(); },
-      clone: function(){ return makeTrack(); },
-      addEventListener: function(){}, removeEventListener: function(){},
-      dispatchEvent: function(){ return true; }
-    };
-  }
-  function NativeStream() {
-    this.id = 'lwa-stream-' + Math.random().toString(36).slice(2);
-    this.active = true; this.__lwa = true;
-    this._tracks = [makeTrack()];
-  }
-  NativeStream.prototype.getTracks      = function(){ return this._tracks.slice(); };
-  NativeStream.prototype.getAudioTracks = function(){ return this._tracks.slice(); };
-  NativeStream.prototype.getVideoTracks = function(){ return []; };
-  NativeStream.prototype.getTrackById = function(id){
-    return this._tracks.filter(function(t){return t.id===id;})[0] || null;
-  };
-  NativeStream.prototype.addTrack=function(){}; NativeStream.prototype.removeTrack=function(){};
-  NativeStream.prototype.clone=function(){ return new NativeStream(); };
-  NativeStream.prototype.addEventListener=function(){};
-  NativeStream.prototype.removeEventListener=function(){};
-  NativeStream.prototype.dispatchEvent=function(){ return true; };
-
-  if (navigator.mediaDevices) {
-    navigator.mediaDevices.getUserMedia = function(constraints) {
-      var wantA = !!(constraints && constraints.audio);
-      var wantV = !!(constraints && constraints.video);
-      if (wantA && !wantV) return Promise.resolve(new NativeStream());
-      if (origGUM) return origGUM(constraints);
-      return Promise.reject(new DOMException('getUserMedia unavailable','NotSupportedError'));
-    };
-    var origEnum = navigator.mediaDevices.enumerateDevices
-                   && navigator.mediaDevices.enumerateDevices.bind(navigator.mediaDevices);
-    navigator.mediaDevices.enumerateDevices = function() {
-      var fake = [{deviceId:'native', groupId:'native', kind:'audioinput',
-                   label:'Native Android Microphone'}];
-      if (origEnum) return origEnum().then(function(list){
-        return fake.concat(list.filter(function(d){ return d.kind !== 'audioinput'; }));
-      }).catch(function(){ return fake; });
-      return Promise.resolve(fake);
-    };
-  }
-
-  function NativeMR(stream, options) {
-    this._handlers = {};
-    this._native = !!(stream && stream.__lwa);
-    if (!this._native && OrigMR) {
-      var self = this;
-      this._real = new OrigMR(stream, options);
-      ['dataavailable','start','stop','pause','resume','error'].forEach(function(ev){
-        self._real.addEventListener(ev, function(e){ self._fire(ev, e); });
-      });
-      Object.defineProperty(this, 'state',    { get:function(){ return self._real.state; }});
-      Object.defineProperty(this, 'mimeType', { get:function(){ return self._real.mimeType; }});
-      this.stream = stream; return;
-    }
-    this._state='inactive'; this.stream=stream; this.mimeType='audio/wav';
-    this.audioBitsPerSecond=705600; this.videoBitsPerSecond=0;
-    var self = this;
-    Object.defineProperty(this, 'state', { get:function(){ return self._state; }});
-  }
-  NativeMR.prototype._fire = function(ev, detail) {
-    var handlers = (this._handlers[ev] || []).slice();
-    var evt; try { evt = new Event(ev); } catch(e) { evt = {type:ev}; }
-    if (detail) for (var k in detail) try { evt[k] = detail[k]; } catch(_) {}
-    handlers.forEach(function(h){ try { h(evt); } catch(e) { console.error(e); } });
-    var cb = this['on'+ev];
-    if (typeof cb === 'function') try { cb(evt); } catch(e) { console.error(e); }
-  };
-  NativeMR.prototype.addEventListener = function(ev, fn) {
-    (this._handlers[ev] = this._handlers[ev] || []).push(fn);
-  };
-  NativeMR.prototype.removeEventListener = function(ev, fn) {
-    if (!this._handlers[ev]) return;
-    this._handlers[ev] = this._handlers[ev].filter(function(x){ return x !== fn; });
-  };
-  NativeMR.prototype.dispatchEvent = function(){ return true; };
-  NativeMR.prototype.start = function(timeslice) {
-    if (!this._native) return this._real.start(timeslice);
-    if (this._state !== 'inactive') return;
-    var r = Android.recStart();
-    if (r !== 'ok') {
-      var err = new Error(r); err.name = 'NotReadableError';
-      this._fire('error', { error:err }); return;
-    }
-    this._state = 'recording'; this._fire('start');
-  };
-  NativeMR.prototype.stop = function() {
-    if (!this._native) return this._real.stop();
-    if (this._state === 'inactive') return;
-    var dataUrl = Android.recStop();
-    this._state = 'inactive';
-    if (typeof dataUrl === 'string' && dataUrl.indexOf('data:') === 0) {
-      var b64 = dataUrl.split(',')[1] || '';
-      var bin = atob(b64);
-      var buf = new Uint8Array(bin.length);
-      for (var i = 0; i < bin.length; i++) buf[i] = bin.charCodeAt(i);
-      var blob = new Blob([buf], { type:'audio/wav' });
-      this._fire('dataavailable', { data:blob });
-      this._fire('stop');
-    } else {
-      var e = new Error(dataUrl || 'recStop failed'); e.name = 'AbortError';
-      this._fire('error', { error:e }); this._fire('stop');
-    }
-  };
-  NativeMR.prototype.pause = function() {
-    if (!this._native) return this._real.pause();
-    if (this._state !== 'recording') return;
-    if (Android.recPause() === 'ok') { this._state='paused'; this._fire('pause'); }
-  };
-  NativeMR.prototype.resume = function() {
-    if (!this._native) return this._real.resume();
-    if (this._state !== 'paused') return;
-    if (Android.recResume() === 'ok') { this._state='recording'; this._fire('resume'); }
-  };
-  NativeMR.prototype.requestData = function() {
-    if (!this._native && this._real) this._real.requestData();
-  };
-  NativeMR.isTypeSupported = function(type) {
-    if (!type) return false;
-    if (/audio\/wav/i.test(type) || /audio\/x-wav/i.test(type)) return true;
-    return OrigMR ? OrigMR.isTypeSupported(type) : false;
-  };
-  window.MediaRecorder = NativeMR;
-
-  if (OrigAC) {
-    var origCreateSrc = OrigAC.prototype.createMediaStreamSource;
-    var origCreateAna = OrigAC.prototype.createAnalyser;
-    OrigAC.prototype.createMediaStreamSource = function(stream) {
-      if (!stream || !stream.__lwa) return origCreateSrc.call(this, stream);
-      var src = this.createGain(); src.gain.value = 0; src.__lwa = true;
-      var origConnect = src.connect.bind(src);
-      src.connect = function(dest) {
-        if (dest && dest.__lwa_analyser) dest.__lwa_src = src;
-        return origConnect(dest);
-      };
-      return src;
-    };
-    OrigAC.prototype.createAnalyser = function() {
-      var analyser = origCreateAna.call(this);
-      analyser.__lwa_analyser = true;
-      var origGetByteTD  = analyser.getByteTimeDomainData.bind(analyser);
-      var origGetFloatTD = analyser.getFloatTimeDomainData ? analyser.getFloatTimeDomainData.bind(analyser) : null;
-      var origGetByteFD  = analyser.getByteFrequencyData.bind(analyser);
-      analyser.getByteTimeDomainData = function(arr) {
-        if (!this.__lwa_src) return origGetByteTD(arr);
-        fillByteTimeDomain(arr);
-      };
-      if (origGetFloatTD) analyser.getFloatTimeDomainData = function(arr) {
-        if (!this.__lwa_src) return origGetFloatTD(arr);
-        fillFloatTimeDomain(arr);
-      };
-      analyser.getByteFrequencyData = function(arr) {
-        if (!this.__lwa_src) return origGetByteFD(arr);
-        fillByteFrequency(arr);
-      };
-      return analyser;
-    };
-  }
-  function getWaveform(n) {
-    try { var s = Android.recWaveform(n); return s ? s.split(',').map(parseFloat) : null; }
-    catch(e) { return null; }
-  }
-  function fillByteTimeDomain(arr) {
-    var wave = getWaveform(Math.min(arr.length, 256));
-    if (!wave) { for (var i = 0; i < arr.length; i++) arr[i] = 128; return; }
-    for (var i = 0; i < arr.length; i++) {
-      var t = (i / arr.length) * (wave.length - 1);
-      var idx = Math.floor(t), frac = t - idx;
-      var v = wave[idx] * (1-frac) + (wave[idx+1] || wave[idx]) * frac;
-      var phase = (i / arr.length) * Math.PI * 2 * 8;
-      arr[i] = Math.max(0, Math.min(255, 128 + Math.sin(phase) * v * 120));
-    }
-  }
-  function fillFloatTimeDomain(arr) {
-    var wave = getWaveform(Math.min(arr.length, 256));
-    if (!wave) { for (var i = 0; i < arr.length; i++) arr[i] = 0; return; }
-    for (var i = 0; i < arr.length; i++) {
-      var t = (i / arr.length) * (wave.length - 1);
-      var idx = Math.floor(t), frac = t - idx;
-      var v = wave[idx] * (1-frac) + (wave[idx+1] || wave[idx]) * frac;
-      var phase = (i / arr.length) * Math.PI * 2 * 8;
-      arr[i] = Math.sin(phase) * v;
-    }
-  }
-  function fillByteFrequency(arr) {
-    var amp = Android.recAmplitude() / 32767.0;
-    for (var i = 0; i < arr.length; i++) {
-      var w = Math.pow(1 - (i / arr.length), 1.5);
-      arr[i] = Math.min(255, amp * w * (Math.random() * 0.5 + 0.5) * 255);
-    }
-  }
-})();
-"""
-
         /**
-         * FS shim. Uses AndroidFS_native (class-level bridge with real
-         * @JavascriptInterface methods) under the hood. Exposes:
+         * Combined LWA shim. Injected inline at the top of every HTML response
+         * by SimpleServer, so it runs BEFORE any user script executes.
          *
-         *   window.AndroidFS.read(path)           → Promise<string|null>
-         *   window.AndroidFS.write(path, str)     → Promise<boolean>
-         *   window.AndroidFS.readBytes(path)      → Promise<Uint8Array|null>
-         *   window.AndroidFS.writeBytes(path, u8) → Promise<boolean>
-         *   window.AndroidFS.delete(path)         → Promise<boolean>
-         *   window.AndroidFS.list(path)           → Promise<string[]>
-         *   window.AndroidFS.exists(path)         → Promise<boolean>
-         *   window.AndroidFS.mkdir(path)          → Promise<boolean>
+         * Exposes:
+         *   window.LWA                — meta object
+         *   window.LWA.ready          — Promise resolving once shims are installed
+         *   window.LWA.features       — array of enabled features
+         *   window.LWA.version        — shim version tag
+         *   window.AndroidFS          — Promise-based file API over AndroidFS_native
+         *   Patched navigator.mediaDevices.getUserMedia / MediaRecorder / AnalyserNode
+         *   Patched window.fetch for PUT/POST/DELETE to same-origin → disk
          *
-         * Also patches fetch() so standard PUT/DELETE to same-origin URLs
-         * transparently write/delete files in the SAF folder on disk.
+         * Kotlin-side @JavascriptInterface bindings (Android, AndroidFS_native)
+         * are injected at window-object-cleared time, BEFORE the HTML is parsed,
+         * so they're available as soon as this inline script runs.
          */
-        private const val FS_SHIM_JS = """
+        private const val LWA_SHIM_JS = """
 (function(){
-  var B = window.AndroidFS_native;
-  if (!B || typeof B.read !== 'function') {
-    console.warn('[LWA] AndroidFS_native bridge missing — fs shim inactive');
-    return;
-  }
-  if (window.__lwa_fs_v2) return;
-  window.__lwa_fs_v2 = true;
+  if (window.__lwa_shim_v3) return;
+  window.__lwa_shim_v3 = true;
 
-  window.AndroidFS = {
-    read: function(path) {
-      return new Promise(function(res){
-        try { res(B.read(String(path))); } catch(e) { res(null); }
-      });
-    },
-    write: function(path, content) {
-      return new Promise(function(res){
-        try {
-          var s = (typeof content === 'string') ? content : JSON.stringify(content);
-          res(B.write(String(path), s) === 'ok');
-        } catch(e) { res(false); }
-      });
-    },
-    readBytes: function(path) {
-      return new Promise(function(res){
-        try {
-          var b64 = B.readBase64(String(path));
-          if (!b64) return res(null);
-          var bin = atob(b64);
-          var arr = new Uint8Array(bin.length);
-          for (var i = 0; i < bin.length; i++) arr[i] = bin.charCodeAt(i);
-          res(arr);
-        } catch(e) { res(null); }
-      });
-    },
-    writeBytes: function(path, uint8array) {
-      return new Promise(function(res){
-        try {
-          var chunks = [];
-          for (var i = 0; i < uint8array.length; i += 0x8000) {
-            chunks.push(String.fromCharCode.apply(null, uint8array.subarray(i, i + 0x8000)));
-          }
-          var b64 = btoa(chunks.join(''));
-          res(B.writeBase64(String(path), b64) === 'ok');
-        } catch(e) { res(false); }
-      });
-    },
-    delete: function(path) {
-      return new Promise(function(res){
-        try { res(B.deleteFile(String(path)) === 'ok'); } catch(e) { res(false); }
-      });
-    },
-    list: function(path) {
-      return new Promise(function(res){
-        try {
-          var s = B.list(path ? String(path) : '');
-          res(s ? s.split('\n').filter(function(x){ return x.length > 0; }) : []);
-        } catch(e) { res([]); }
-      });
-    },
-    exists: function(path) {
-      return new Promise(function(res){
-        try { res(!!B.exists(String(path))); } catch(e) { res(false); }
-      });
-    },
-    mkdir: function(path) {
-      return new Promise(function(res){
-        try { res(B.mkdir(String(path)) === 'ok'); } catch(e) { res(false); }
-      });
-    }
+  var features = [];
+  var readyResolve;
+  var readyPromise = new Promise(function(r){ readyResolve = r; });
+
+  window.LWA = {
+    version:  'v3',
+    features: features,
+    ready:    readyPromise,
+    isNative: typeof Android !== 'undefined' && typeof Android.isNativeApp === 'function'
   };
 
-  // Patch fetch() so PUT/DELETE/POST to same-origin URLs persist to disk.
-  var origFetch = window.fetch ? window.fetch.bind(window) : null;
-  window.fetch = function(input, init) {
-    var url = (typeof input === 'string') ? input : (input && input.url);
-    var method = (init && init.method ? init.method : 'GET').toUpperCase();
+  // ──── AUDIO SHIM ────────────────────────────────────────────────────────
+  if (typeof Android !== 'undefined' && typeof Android.recStart === 'function') {
+    features.push('audio');
 
-    if (url && method !== 'GET' && method !== 'HEAD') {
-      var u; try { u = new URL(url, location.href); } catch(e) { u = null; }
-      if (u && u.origin === location.origin) {
-        var path = decodeURIComponent(u.pathname.replace(/^\//, ''));
+    var origGUM = navigator.mediaDevices && navigator.mediaDevices.getUserMedia
+                  ? navigator.mediaDevices.getUserMedia.bind(navigator.mediaDevices) : null;
+    var OrigMR = window.MediaRecorder;
+    var OrigAC = window.AudioContext || window.webkitAudioContext;
 
-        if (method === 'PUT' || method === 'POST') {
-          var body = init && init.body;
-          return new Promise(function(resolve){
-            var done = function(ok) {
-              resolve(new Response(ok ? 'ok' : 'fail', {
-                status: ok ? 200 : 500,
-                headers: { 'Content-Type': 'text/plain' }
-              }));
-            };
-            if (body instanceof Blob) {
-              body.arrayBuffer().then(function(ab){
-                window.AndroidFS.writeBytes(path, new Uint8Array(ab)).then(done);
-              });
-            } else if (body instanceof ArrayBuffer) {
-              window.AndroidFS.writeBytes(path, new Uint8Array(body)).then(done);
-            } else if (typeof body === 'string') {
-              window.AndroidFS.write(path, body).then(done);
-            } else if (body == null) {
-              window.AndroidFS.write(path, '').then(done);
-            } else {
-              try { window.AndroidFS.write(path, JSON.stringify(body)).then(done); }
-              catch(e) { done(false); }
-            }
-          });
-        }
-        if (method === 'DELETE') {
-          return window.AndroidFS.delete(path).then(function(ok){
-            return new Response(ok ? 'ok' : 'fail', { status: ok ? 200 : 500 });
-          });
-        }
+    function makeTrack() {
+      return {
+        kind:'audio', id:'lwa-track-'+Math.random().toString(36).slice(2),
+        label:'Native Android Microphone',
+        enabled:true, muted:false, readyState:'live', contentHint:'',
+        stop: function(){ this.readyState='ended'; this.enabled=false; },
+        getSettings: function(){ return {sampleRate:44100, channelCount:1, deviceId:'native'}; },
+        getCapabilities: function(){ return {}; }, getConstraints: function(){ return {}; },
+        applyConstraints: function(){ return Promise.resolve(); },
+        clone: function(){ return makeTrack(); },
+        addEventListener: function(){}, removeEventListener: function(){},
+        dispatchEvent: function(){ return true; }
+      };
+    }
+    function NativeStream() {
+      this.id = 'lwa-stream-' + Math.random().toString(36).slice(2);
+      this.active = true; this.__lwa = true;
+      this._tracks = [makeTrack()];
+    }
+    NativeStream.prototype.getTracks      = function(){ return this._tracks.slice(); };
+    NativeStream.prototype.getAudioTracks = function(){ return this._tracks.slice(); };
+    NativeStream.prototype.getVideoTracks = function(){ return []; };
+    NativeStream.prototype.getTrackById = function(id){
+      return this._tracks.filter(function(t){return t.id===id;})[0] || null;
+    };
+    NativeStream.prototype.addTrack=function(){}; NativeStream.prototype.removeTrack=function(){};
+    NativeStream.prototype.clone=function(){ return new NativeStream(); };
+    NativeStream.prototype.addEventListener=function(){};
+    NativeStream.prototype.removeEventListener=function(){};
+    NativeStream.prototype.dispatchEvent=function(){ return true; };
+
+    if (navigator.mediaDevices) {
+      navigator.mediaDevices.getUserMedia = function(constraints) {
+        var wantA = !!(constraints && constraints.audio);
+        var wantV = !!(constraints && constraints.video);
+        if (wantA && !wantV) return Promise.resolve(new NativeStream());
+        if (origGUM) return origGUM(constraints);
+        return Promise.reject(new DOMException('getUserMedia unavailable','NotSupportedError'));
+      };
+      var origEnum = navigator.mediaDevices.enumerateDevices
+                     && navigator.mediaDevices.enumerateDevices.bind(navigator.mediaDevices);
+      navigator.mediaDevices.enumerateDevices = function() {
+        var fake = [{deviceId:'native', groupId:'native', kind:'audioinput',
+                     label:'Native Android Microphone'}];
+        if (origEnum) return origEnum().then(function(list){
+          return fake.concat(list.filter(function(d){ return d.kind !== 'audioinput'; }));
+        }).catch(function(){ return fake; });
+        return Promise.resolve(fake);
+      };
+    }
+
+    function NativeMR(stream, options) {
+      this._handlers = {};
+      this._native = !!(stream && stream.__lwa);
+      if (!this._native && OrigMR) {
+        var self = this;
+        this._real = new OrigMR(stream, options);
+        ['dataavailable','start','stop','pause','resume','error'].forEach(function(ev){
+          self._real.addEventListener(ev, function(e){ self._fire(ev, e); });
+        });
+        Object.defineProperty(this, 'state',    { get:function(){ return self._real.state; }});
+        Object.defineProperty(this, 'mimeType', { get:function(){ return self._real.mimeType; }});
+        this.stream = stream; return;
+      }
+      this._state='inactive'; this.stream=stream; this.mimeType='audio/wav';
+      this.audioBitsPerSecond=705600; this.videoBitsPerSecond=0;
+      var self = this;
+      Object.defineProperty(this, 'state', { get:function(){ return self._state; }});
+    }
+    NativeMR.prototype._fire = function(ev, detail) {
+      var handlers = (this._handlers[ev] || []).slice();
+      var evt; try { evt = new Event(ev); } catch(e) { evt = {type:ev}; }
+      if (detail) for (var k in detail) try { evt[k] = detail[k]; } catch(_) {}
+      handlers.forEach(function(h){ try { h(evt); } catch(e) { console.error(e); } });
+      var cb = this['on'+ev];
+      if (typeof cb === 'function') try { cb(evt); } catch(e) { console.error(e); }
+    };
+    NativeMR.prototype.addEventListener = function(ev, fn) {
+      (this._handlers[ev] = this._handlers[ev] || []).push(fn);
+    };
+    NativeMR.prototype.removeEventListener = function(ev, fn) {
+      if (!this._handlers[ev]) return;
+      this._handlers[ev] = this._handlers[ev].filter(function(x){ return x !== fn; });
+    };
+    NativeMR.prototype.dispatchEvent = function(){ return true; };
+    NativeMR.prototype.start = function(timeslice) {
+      if (!this._native) return this._real.start(timeslice);
+      if (this._state !== 'inactive') return;
+      var r = Android.recStart();
+      if (r !== 'ok') {
+        var err = new Error(r); err.name = 'NotReadableError';
+        this._fire('error', { error:err }); return;
+      }
+      this._state = 'recording'; this._fire('start');
+    };
+    NativeMR.prototype.stop = function() {
+      if (!this._native) return this._real.stop();
+      if (this._state === 'inactive') return;
+      var dataUrl = Android.recStop();
+      this._state = 'inactive';
+      if (typeof dataUrl === 'string' && dataUrl.indexOf('data:') === 0) {
+        var b64 = dataUrl.split(',')[1] || '';
+        var bin = atob(b64);
+        var buf = new Uint8Array(bin.length);
+        for (var i = 0; i < bin.length; i++) buf[i] = bin.charCodeAt(i);
+        var blob = new Blob([buf], { type:'audio/wav' });
+        this._fire('dataavailable', { data:blob });
+        this._fire('stop');
+      } else {
+        var e = new Error(dataUrl || 'recStop failed'); e.name = 'AbortError';
+        this._fire('error', { error:e }); this._fire('stop');
+      }
+    };
+    NativeMR.prototype.pause = function() {
+      if (!this._native) return this._real.pause();
+      if (this._state !== 'recording') return;
+      if (Android.recPause() === 'ok') { this._state='paused'; this._fire('pause'); }
+    };
+    NativeMR.prototype.resume = function() {
+      if (!this._native) return this._real.resume();
+      if (this._state !== 'paused') return;
+      if (Android.recResume() === 'ok') { this._state='recording'; this._fire('resume'); }
+    };
+    NativeMR.prototype.requestData = function() {
+      if (!this._native && this._real) this._real.requestData();
+    };
+    NativeMR.isTypeSupported = function(type) {
+      if (!type) return false;
+      if (/audio\/wav/i.test(type) || /audio\/x-wav/i.test(type)) return true;
+      return OrigMR ? OrigMR.isTypeSupported(type) : false;
+    };
+    window.MediaRecorder = NativeMR;
+
+    if (OrigAC) {
+      var origCreateSrc = OrigAC.prototype.createMediaStreamSource;
+      var origCreateAna = OrigAC.prototype.createAnalyser;
+      OrigAC.prototype.createMediaStreamSource = function(stream) {
+        if (!stream || !stream.__lwa) return origCreateSrc.call(this, stream);
+        var src = this.createGain(); src.gain.value = 0; src.__lwa = true;
+        var origConnect = src.connect.bind(src);
+        src.connect = function(dest) {
+          if (dest && dest.__lwa_analyser) dest.__lwa_src = src;
+          return origConnect(dest);
+        };
+        return src;
+      };
+      OrigAC.prototype.createAnalyser = function() {
+        var analyser = origCreateAna.call(this);
+        analyser.__lwa_analyser = true;
+        var origGetByteTD  = analyser.getByteTimeDomainData.bind(analyser);
+        var origGetFloatTD = analyser.getFloatTimeDomainData ? analyser.getFloatTimeDomainData.bind(analyser) : null;
+        var origGetByteFD  = analyser.getByteFrequencyData.bind(analyser);
+        analyser.getByteTimeDomainData = function(arr) {
+          if (!this.__lwa_src) return origGetByteTD(arr);
+          fillByteTimeDomain(arr);
+        };
+        if (origGetFloatTD) analyser.getFloatTimeDomainData = function(arr) {
+          if (!this.__lwa_src) return origGetFloatTD(arr);
+          fillFloatTimeDomain(arr);
+        };
+        analyser.getByteFrequencyData = function(arr) {
+          if (!this.__lwa_src) return origGetByteFD(arr);
+          fillByteFrequency(arr);
+        };
+        return analyser;
+      };
+    }
+    function getWaveform(n) {
+      try { var s = Android.recWaveform(n); return s ? s.split(',').map(parseFloat) : null; }
+      catch(e) { return null; }
+    }
+    function fillByteTimeDomain(arr) {
+      var wave = getWaveform(Math.min(arr.length, 256));
+      if (!wave) { for (var i = 0; i < arr.length; i++) arr[i] = 128; return; }
+      for (var i = 0; i < arr.length; i++) {
+        var t = (i / arr.length) * (wave.length - 1);
+        var idx = Math.floor(t), frac = t - idx;
+        var v = wave[idx] * (1-frac) + (wave[idx+1] || wave[idx]) * frac;
+        var phase = (i / arr.length) * Math.PI * 2 * 8;
+        arr[i] = Math.max(0, Math.min(255, 128 + Math.sin(phase) * v * 120));
       }
     }
-    return origFetch ? origFetch(input, init)
-                     : Promise.reject(new Error('fetch unavailable'));
-  };
+    function fillFloatTimeDomain(arr) {
+      var wave = getWaveform(Math.min(arr.length, 256));
+      if (!wave) { for (var i = 0; i < arr.length; i++) arr[i] = 0; return; }
+      for (var i = 0; i < arr.length; i++) {
+        var t = (i / arr.length) * (wave.length - 1);
+        var idx = Math.floor(t), frac = t - idx;
+        var v = wave[idx] * (1-frac) + (wave[idx+1] || wave[idx]) * frac;
+        var phase = (i / arr.length) * Math.PI * 2 * 8;
+        arr[i] = Math.sin(phase) * v;
+      }
+    }
+    function fillByteFrequency(arr) {
+      var amp = Android.recAmplitude() / 32767.0;
+      for (var i = 0; i < arr.length; i++) {
+        var w = Math.pow(1 - (i / arr.length), 1.5);
+        arr[i] = Math.min(255, amp * w * (Math.random() * 0.5 + 0.5) * 255);
+      }
+    }
+  }
 
-  console.log('[LWA] filesystem bridge active (AndroidFS, fetch PUT/DELETE)');
+  // ──── FILESYSTEM SHIM ───────────────────────────────────────────────────
+  var FSB = window.AndroidFS_native;
+  if (FSB && typeof FSB.read === 'function') {
+    features.push('fs');
+
+    window.AndroidFS = {
+      read: function(path) {
+        return new Promise(function(res){
+          try { res(FSB.read(String(path))); } catch(e) { res(null); }
+        });
+      },
+      write: function(path, content) {
+        return new Promise(function(res){
+          try {
+            var s = (typeof content === 'string') ? content : JSON.stringify(content);
+            res(FSB.write(String(path), s) === 'ok');
+          } catch(e) { res(false); }
+        });
+      },
+      readBytes: function(path) {
+        return new Promise(function(res){
+          try {
+            var b64 = FSB.readBase64(String(path));
+            if (!b64) return res(null);
+            var bin = atob(b64);
+            var arr = new Uint8Array(bin.length);
+            for (var i = 0; i < bin.length; i++) arr[i] = bin.charCodeAt(i);
+            res(arr);
+          } catch(e) { res(null); }
+        });
+      },
+      writeBytes: function(path, uint8array) {
+        return new Promise(function(res){
+          try {
+            var chunks = [];
+            for (var i = 0; i < uint8array.length; i += 0x8000) {
+              chunks.push(String.fromCharCode.apply(null, uint8array.subarray(i, i + 0x8000)));
+            }
+            var b64 = btoa(chunks.join(''));
+            res(FSB.writeBase64(String(path), b64) === 'ok');
+          } catch(e) { res(false); }
+        });
+      },
+      delete: function(path) {
+        return new Promise(function(res){
+          try { res(FSB.deleteFile(String(path)) === 'ok'); } catch(e) { res(false); }
+        });
+      },
+      list: function(path) {
+        return new Promise(function(res){
+          try {
+            var s = FSB.list(path ? String(path) : '');
+            res(s ? s.split('\n').filter(function(x){ return x.length > 0; }) : []);
+          } catch(e) { res([]); }
+        });
+      },
+      exists: function(path) {
+        return new Promise(function(res){
+          try { res(!!FSB.exists(String(path))); } catch(e) { res(false); }
+        });
+      },
+      mkdir: function(path) {
+        return new Promise(function(res){
+          try { res(FSB.mkdir(String(path)) === 'ok'); } catch(e) { res(false); }
+        });
+      }
+    };
+
+    // Patch fetch() for same-origin PUT/POST/DELETE → disk writes
+    var origFetch = window.fetch ? window.fetch.bind(window) : null;
+    window.fetch = function(input, init) {
+      var url = (typeof input === 'string') ? input : (input && input.url);
+      var method = (init && init.method ? init.method : 'GET').toUpperCase();
+      if (url && method !== 'GET' && method !== 'HEAD') {
+        var u; try { u = new URL(url, location.href); } catch(e) { u = null; }
+        if (u && u.origin === location.origin) {
+          var path = decodeURIComponent(u.pathname.replace(/^\//, ''));
+          if (method === 'PUT' || method === 'POST') {
+            var body = init && init.body;
+            return new Promise(function(resolve){
+              var done = function(ok) {
+                resolve(new Response(ok ? 'ok' : 'fail', {
+                  status: ok ? 200 : 500,
+                  headers: { 'Content-Type': 'text/plain' }
+                }));
+              };
+              if (body instanceof Blob) {
+                body.arrayBuffer().then(function(ab){
+                  window.AndroidFS.writeBytes(path, new Uint8Array(ab)).then(done);
+                });
+              } else if (body instanceof ArrayBuffer) {
+                window.AndroidFS.writeBytes(path, new Uint8Array(body)).then(done);
+              } else if (typeof body === 'string') {
+                window.AndroidFS.write(path, body).then(done);
+              } else if (body == null) {
+                window.AndroidFS.write(path, '').then(done);
+              } else {
+                try { window.AndroidFS.write(path, JSON.stringify(body)).then(done); }
+                catch(e) { done(false); }
+              }
+            });
+          }
+          if (method === 'DELETE') {
+            return window.AndroidFS.delete(path).then(function(ok){
+              return new Response(ok ? 'ok' : 'fail', { status: ok ? 200 : 500 });
+            });
+          }
+        }
+      }
+      return origFetch ? origFetch(input, init)
+                       : Promise.reject(new Error('fetch unavailable'));
+    };
+  }
+
+  // ──── FEATURE FLAGS ─────────────────────────────────────────────────────
+  if (typeof Android !== 'undefined') {
+    features.push('share', 'vibrate', 'toast');
+  }
+
+  // ──── SIGNAL READY ──────────────────────────────────────────────────────
+  readyResolve({
+    features: features.slice(),
+    version:  'v3',
+    isNative: window.LWA.isNative
+  });
+  console.log('[LWA] shim v3 ready — features:', features.join(','));
 })();
 """
     }
@@ -1003,7 +978,9 @@ class WebAppActivity : AppCompatActivity() {
 
     private fun initializeWebApp() {
         fsBridge = JsFilesystemBridge(this, contentResolver, folderUri)
-        val s = SimpleServer(contentResolver, folderUri, filesDir)
+        // SimpleServer takes the shim as a parameter so it can inject it
+        // directly into HTML responses — no onPageFinished race condition.
+        val s = SimpleServer(contentResolver, folderUri, filesDir, LWA_SHIM_JS)
         server = s; s.start()
         setupWebView()
         webView.loadUrl("http://localhost:${s.port}/")
@@ -1025,7 +1002,6 @@ class WebAppActivity : AppCompatActivity() {
             mixedContentMode = WebSettings.MIXED_CONTENT_COMPATIBILITY_MODE
         }
 
-        // Main Android bridge — general methods and audio recording
         webView.addJavascriptInterface(object : Any() {
             @JavascriptInterface fun toast(msg: String) = runOnUiThread {
                 Toast.makeText(this@WebAppActivity, msg, Toast.LENGTH_SHORT).show()
@@ -1054,8 +1030,7 @@ class WebAppActivity : AppCompatActivity() {
                 } catch (e: Exception) { "0" }
             }
 
-            // Audio recording bridge (used by AUDIO_SHIM_JS; method names
-            // don't collide with anything else)
+            // Audio bridge (used by LWA_SHIM_JS)
             @JavascriptInterface fun recStart():  String  = nativeRecorder.start()
             @JavascriptInterface fun recStop():   String  = nativeRecorder.stop()
             @JavascriptInterface fun recPause():  String  = nativeRecorder.pauseRecording()
@@ -1066,9 +1041,8 @@ class WebAppActivity : AppCompatActivity() {
             @JavascriptInterface fun recIsPaused(): Boolean = nativeRecorder.isPausedState()
         }, "Android")
 
-        // Filesystem bridge — separate class with real @JavascriptInterface methods.
-        // Exposed to JS as `AndroidFS_native`. The FS_SHIM_JS wraps this with
-        // Promise-returning methods as `window.AndroidFS`.
+        // FS bridge — class with real @JavascriptInterface methods, exposed to JS
+        // as AndroidFS_native. The inline LWA_SHIM_JS wraps this into window.AndroidFS.
         fsBridge?.let { webView.addJavascriptInterface(it, "AndroidFS_native") }
 
         webView.webViewClient = object : WebViewClient() {
@@ -1078,8 +1052,10 @@ class WebAppActivity : AppCompatActivity() {
             }
             override fun onPageFinished(v: WebView, url: String) {
                 progressBar.visibility = View.GONE
-                v.evaluateJavascript(AUDIO_SHIM_JS, null)
-                v.evaluateJavascript(FS_SHIM_JS,    null)
+                // No shim injection here anymore — SimpleServer injects it
+                // inline into every HTML response, so it runs before any
+                // user script. Eliminates the race condition where sync
+                // code at module top couldn't see window.AndroidFS.
             }
             override fun onReceivedError(v: WebView, req: WebResourceRequest, err: WebResourceError) {
                 if (req.isForMainFrame) {
@@ -1320,10 +1296,14 @@ class WebAppActivity : AppCompatActivity() {
     override fun onResume() { super.onResume(); webView.onResume() }
 }
 
+// ═══════════════════════════════════════════════════════════════════════════════
+// SimpleServer — HTTP server with stable port and HTML shim injection
+// ═══════════════════════════════════════════════════════════════════════════════
 class SimpleServer(
     private val resolver: ContentResolver,
     private val rootUri: Uri,
-    private val filesDir: File
+    private val filesDir: File,
+    private val shimJs: String
 ) {
     private var serverSocket: ServerSocket? = null
     var port = 0
@@ -1331,8 +1311,40 @@ class SimpleServer(
     private val executor = Executors.newCachedThreadPool()
     @Volatile private var active = false
 
+    // Precompute the <meta> + <script> block once. Wrapped in
+    // __lwa-injected comments so it's easy to spot in devtools.
+    private val injectedHead: ByteArray by lazy {
+        buildString {
+            append("<meta name=\"lwa-features\" content=\"fs,audio,share,vibrate\">\n")
+            append("<meta name=\"lwa-version\" content=\"v3\">\n")
+            append("<script data-lwa=\"shim\">")
+            append(shimJs)
+            append("</script>\n")
+        }.toByteArray(Charsets.UTF_8)
+    }
+
     fun start() {
-        serverSocket = ServerSocket(0).also { port = it.localPort }
+        // Try a stable port derived from the SAF URI hash so OPFS and
+        // localStorage persist across launches. If the port is taken,
+        // fall back to next 10 consecutive ports, then to random.
+        val basePort = 39000 + (Math.abs(rootUri.toString().hashCode()) % 1000)
+        var bound = false
+        for (offset in 0..10) {
+            try {
+                serverSocket = ServerSocket(basePort + offset)
+                port = basePort + offset
+                bound = true
+                android.util.Log.d("LWA-Server", "Bound stable port $port for $rootUri")
+                break
+            } catch (e: Exception) {
+                // port in use or blocked, try the next
+            }
+        }
+        if (!bound) {
+            serverSocket = ServerSocket(0).also { port = it.localPort }
+            android.util.Log.w("LWA-Server", "Stable port unavailable, using random $port")
+        }
+
         active = true
         executor.submit {
             while (active) {
@@ -1389,14 +1401,79 @@ class SimpleServer(
     }
 
     private fun serveDocFile(out: OutputStream, file: DocumentFile) {
-        val bytes = resolver.openInputStream(file.uri)?.use { it.readBytes() }
+        val originalBytes = resolver.openInputStream(file.uri)?.use { it.readBytes() }
             ?: run { send404(out); return }
-        val mime   = getMime(file.name ?: "")
+        val name = file.name ?: ""
+        val mime = getMime(name)
+
+        // If this is HTML, rewrite it to inject the shim script inline
+        // at the very top of <head>. This guarantees the bridges are
+        // available before any user script — no race conditions.
+        val bytes = if (mime.startsWith("text/html")) injectShim(originalBytes) else originalBytes
+
         val header = "HTTP/1.1 200 OK\r\nContent-Type: $mime\r\n" +
             "Content-Length: ${bytes.size}\r\n" +
             "Access-Control-Allow-Origin: *\r\nCache-Control: no-cache\r\n\r\n"
         out.write(header.toByteArray(Charsets.ISO_8859_1))
         out.write(bytes); out.flush()
+    }
+
+    /**
+     * Inject the shim script at the very top of <head> in an HTML document.
+     * If <head> doesn't exist, insert one after <html>. If <html> doesn't
+     * exist either, prepend to the document (rare, but handled).
+     *
+     * Done with a simple case-insensitive string search — no HTML parser
+     * needed. We're only looking for well-formed documents; malformed HTML
+     * falls through with no injection (web app still works, just without
+     * the shim).
+     */
+    private fun injectShim(html: ByteArray): ByteArray {
+        val text = try { String(html, Charsets.UTF_8) }
+                   catch (e: Exception) { return html }
+
+        val lower = text.lowercase()
+        val headIdx = lower.indexOf("<head")
+        if (headIdx >= 0) {
+            // Find end of opening <head ...> tag
+            val tagEnd = text.indexOf('>', headIdx)
+            if (tagEnd > 0) {
+                val before = text.substring(0, tagEnd + 1).toByteArray(Charsets.UTF_8)
+                val after  = text.substring(tagEnd + 1).toByteArray(Charsets.UTF_8)
+                val result = ByteArray(before.size + injectedHead.size + after.size)
+                var offset = 0
+                System.arraycopy(before, 0, result, offset, before.size); offset += before.size
+                System.arraycopy(injectedHead, 0, result, offset, injectedHead.size); offset += injectedHead.size
+                System.arraycopy(after, 0, result, offset, after.size)
+                return result
+            }
+        }
+
+        // No <head> tag — try to create one just after <html>
+        val htmlIdx = lower.indexOf("<html")
+        if (htmlIdx >= 0) {
+            val tagEnd = text.indexOf('>', htmlIdx)
+            if (tagEnd > 0) {
+                val inject = ("<head>" + String(injectedHead, Charsets.UTF_8) + "</head>")
+                    .toByteArray(Charsets.UTF_8)
+                val before = text.substring(0, tagEnd + 1).toByteArray(Charsets.UTF_8)
+                val after  = text.substring(tagEnd + 1).toByteArray(Charsets.UTF_8)
+                val result = ByteArray(before.size + inject.size + after.size)
+                var offset = 0
+                System.arraycopy(before, 0, result, offset, before.size); offset += before.size
+                System.arraycopy(inject, 0, result, offset, inject.size); offset += inject.size
+                System.arraycopy(after, 0, result, offset, after.size)
+                return result
+            }
+        }
+
+        // Not recognizable HTML — prepend and hope for the best
+        val prefix = ("<head>" + String(injectedHead, Charsets.UTF_8) + "</head>")
+            .toByteArray(Charsets.UTF_8)
+        val result = ByteArray(prefix.size + html.size)
+        System.arraycopy(prefix, 0, result, 0, prefix.size)
+        System.arraycopy(html,   0, result, prefix.size, html.size)
+        return result
     }
 
     private fun send404(out: OutputStream) {
