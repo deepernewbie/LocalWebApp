@@ -423,6 +423,8 @@ class NativeAudioRecorder {
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // JsFilesystemBridge — exposed as AndroidFS_native
+// All methods use block bodies (not expression bodies) so early `return`
+// statements inside try/catch compile correctly.
 // ═══════════════════════════════════════════════════════════════════════════════
 class JsFilesystemBridge(
     private val ctx: android.content.Context,
@@ -449,69 +451,127 @@ class JsFilesystemBridge(
         return null
     }
 
-    @JavascriptInterface fun read(path: String): String? = try {
-        val file = resolvePath(path, false) ?: return null
-        if (!file.isFile) null
-        else resolver.openInputStream(file.uri)?.use { it.readBytes() }?.toString(Charsets.UTF_8)
-    } catch (e: Exception) { android.util.Log.e("LWA-FS", "read $path: ${e.message}"); null }
-
-    @JavascriptInterface fun write(path: String, content: String): String = try {
-        val file = resolvePath(path, true) ?: return "error:path"
-        val bytes = content.toByteArray(Charsets.UTF_8)
-        resolver.openOutputStream(file.uri, "wt")?.use { it.write(bytes) } ?: return "error:no output stream"
-        "ok"
-    } catch (e: Exception) { android.util.Log.e("LWA-FS", "write $path: ${e.message}"); "error:${e.message}" }
-
-    @JavascriptInterface fun readBase64(path: String): String? = try {
-        val file = resolvePath(path, false) ?: return null
-        if (!file.isFile) null
-        else Base64.encodeToString(
-            resolver.openInputStream(file.uri)?.use { it.readBytes() } ?: return null,
-            Base64.NO_WRAP)
-    } catch (e: Exception) { null }
-
-    @JavascriptInterface fun writeBase64(path: String, b64: String): String = try {
-        val file = resolvePath(path, true) ?: return "error:path"
-        resolver.openOutputStream(file.uri, "wt")?.use {
-            it.write(Base64.decode(b64, Base64.DEFAULT))
-        } ?: return "error:no output stream"
-        "ok"
-    } catch (e: Exception) { "error:${e.message}" }
-
-    @JavascriptInterface fun deleteFile(path: String): String = try {
-        val file = resolvePath(path, false) ?: return "error:not found"
-        if (file.delete()) "ok" else "error:delete failed"
-    } catch (e: Exception) { "error:${e.message}" }
-
-    @JavascriptInterface fun list(path: String): String = try {
-        val node = if (path.isEmpty() || path == "/" || path == ".") {
-            DocumentFile.fromTreeUri(ctx, rootUri)
-        } else {
-            val root = DocumentFile.fromTreeUri(ctx, rootUri) ?: return ""
-            val segments = path.split("/", "\\").filter { it.isNotEmpty() && it != ".." && it != "." }
-            var n: DocumentFile = root
-            for (seg in segments) { n = n.findFile(seg) ?: return ""; if (!n.isDirectory) return "" }
-            n
-        } ?: return ""
-        node.listFiles().mapNotNull { it.name }.joinToString("\n")
-    } catch (e: Exception) { "" }
-
-    @JavascriptInterface fun exists(path: String): Boolean = try {
-        val file = resolvePath(path, false); file != null && file.exists()
-    } catch (e: Exception) { false }
-
-    @JavascriptInterface fun mkdir(path: String): String = try {
-        val root = DocumentFile.fromTreeUri(ctx, rootUri) ?: return "error:root"
-        val segments = path.split("/", "\\").filter { it.isNotEmpty() && it != ".." && it != "." }
-        if (segments.isEmpty()) return "error:empty path"
-        var node: DocumentFile = root
-        for (name in segments) {
-            val child = node.findFile(name)
-            node = if (child != null && child.isDirectory) child
-                   else node.createDirectory(name) ?: return "error:mkdir $name"
+    @JavascriptInterface
+    fun read(path: String): String? {
+        return try {
+            val file = resolvePath(path, false) ?: return null
+            if (!file.isFile) return null
+            resolver.openInputStream(file.uri)?.use { it.readBytes() }
+                ?.toString(Charsets.UTF_8)
+        } catch (e: Exception) {
+            android.util.Log.e("LWA-FS", "read $path: ${e.message}")
+            null
         }
-        "ok"
-    } catch (e: Exception) { "error:${e.message}" }
+    }
+
+    @JavascriptInterface
+    fun write(path: String, content: String): String {
+        return try {
+            val file = resolvePath(path, true) ?: return "error:path"
+            val bytes = content.toByteArray(Charsets.UTF_8)
+            val stream = resolver.openOutputStream(file.uri, "wt")
+                ?: return "error:no output stream"
+            stream.use { it.write(bytes) }
+            "ok"
+        } catch (e: Exception) {
+            android.util.Log.e("LWA-FS", "write $path: ${e.message}")
+            "error:${e.message}"
+        }
+    }
+
+    @JavascriptInterface
+    fun readBase64(path: String): String? {
+        return try {
+            val file = resolvePath(path, false) ?: return null
+            if (!file.isFile) return null
+            val bytes = resolver.openInputStream(file.uri)?.use { it.readBytes() }
+                ?: return null
+            Base64.encodeToString(bytes, Base64.NO_WRAP)
+        } catch (e: Exception) {
+            null
+        }
+    }
+
+    @JavascriptInterface
+    fun writeBase64(path: String, b64: String): String {
+        return try {
+            val file = resolvePath(path, true) ?: return "error:path"
+            val bytes = Base64.decode(b64, Base64.DEFAULT)
+            val stream = resolver.openOutputStream(file.uri, "wt")
+                ?: return "error:no output stream"
+            stream.use { it.write(bytes) }
+            "ok"
+        } catch (e: Exception) {
+            "error:${e.message}"
+        }
+    }
+
+    @JavascriptInterface
+    fun deleteFile(path: String): String {
+        return try {
+            val file = resolvePath(path, false) ?: return "error:not found"
+            if (file.delete()) "ok" else "error:delete failed"
+        } catch (e: Exception) {
+            "error:${e.message}"
+        }
+    }
+
+    @JavascriptInterface
+    fun list(path: String): String {
+        return try {
+            val node: DocumentFile? = if (path.isEmpty() || path == "/" || path == ".") {
+                DocumentFile.fromTreeUri(ctx, rootUri)
+            } else {
+                val root = DocumentFile.fromTreeUri(ctx, rootUri)
+                if (root == null) {
+                    null
+                } else {
+                    val segments = path.split("/", "\\")
+                        .filter { it.isNotEmpty() && it != ".." && it != "." }
+                    var n: DocumentFile = root
+                    var failed = false
+                    for (seg in segments) {
+                        val next = n.findFile(seg)
+                        if (next == null || !next.isDirectory) { failed = true; break }
+                        n = next
+                    }
+                    if (failed) null else n
+                }
+            }
+            if (node == null) "" else node.listFiles().mapNotNull { it.name }.joinToString("\n")
+        } catch (e: Exception) {
+            ""
+        }
+    }
+
+    @JavascriptInterface
+    fun exists(path: String): Boolean {
+        return try {
+            val file = resolvePath(path, false)
+            file != null && file.exists()
+        } catch (e: Exception) {
+            false
+        }
+    }
+
+    @JavascriptInterface
+    fun mkdir(path: String): String {
+        return try {
+            val root = DocumentFile.fromTreeUri(ctx, rootUri) ?: return "error:root"
+            val segments = path.split("/", "\\")
+                .filter { it.isNotEmpty() && it != ".." && it != "." }
+            if (segments.isEmpty()) return "error:empty path"
+            var node: DocumentFile = root
+            for (name in segments) {
+                val child = node.findFile(name)
+                node = if (child != null && child.isDirectory) child
+                       else node.createDirectory(name) ?: return "error:mkdir $name"
+            }
+            "ok"
+        } catch (e: Exception) {
+            "error:${e.message}"
+        }
+    }
 }
 
 class WebAppActivity : AppCompatActivity() {
@@ -522,21 +582,18 @@ class WebAppActivity : AppCompatActivity() {
         private const val NET_CACHE = "netcache"
 
         /**
-         * Combined LWA shim. Injected inline at the top of every HTML response
-         * by SimpleServer, so it runs BEFORE any user script executes.
+         * Combined LWA shim v3. Injected inline at the top of <head> by
+         * SimpleServer so it runs BEFORE any user script executes.
          *
          * Exposes:
-         *   window.LWA                — meta object
-         *   window.LWA.ready          — Promise resolving once shims are installed
-         *   window.LWA.features       — array of enabled features
-         *   window.LWA.version        — shim version tag
-         *   window.AndroidFS          — Promise-based file API over AndroidFS_native
-         *   Patched navigator.mediaDevices.getUserMedia / MediaRecorder / AnalyserNode
-         *   Patched window.fetch for PUT/POST/DELETE to same-origin → disk
+         *   window.LWA              — { version, features, ready, isNative }
+         *   window.AndroidFS        — Promise-based file API
+         *   Patched getUserMedia / MediaRecorder / AnalyserNode
+         *   Patched fetch() for PUT/POST/DELETE to same-origin → disk
          *
          * Kotlin-side @JavascriptInterface bindings (Android, AndroidFS_native)
-         * are injected at window-object-cleared time, BEFORE the HTML is parsed,
-         * so they're available as soon as this inline script runs.
+         * are injected at DidClearWindowObject time, BEFORE the HTML is
+         * parsed, so they're already available when this inline script runs.
          */
         private const val LWA_SHIM_JS = """
 (function(){
@@ -978,8 +1035,6 @@ class WebAppActivity : AppCompatActivity() {
 
     private fun initializeWebApp() {
         fsBridge = JsFilesystemBridge(this, contentResolver, folderUri)
-        // SimpleServer takes the shim as a parameter so it can inject it
-        // directly into HTML responses — no onPageFinished race condition.
         val s = SimpleServer(contentResolver, folderUri, filesDir, LWA_SHIM_JS)
         server = s; s.start()
         setupWebView()
@@ -1041,8 +1096,8 @@ class WebAppActivity : AppCompatActivity() {
             @JavascriptInterface fun recIsPaused(): Boolean = nativeRecorder.isPausedState()
         }, "Android")
 
-        // FS bridge — class with real @JavascriptInterface methods, exposed to JS
-        // as AndroidFS_native. The inline LWA_SHIM_JS wraps this into window.AndroidFS.
+        // FS bridge — class with @JavascriptInterface methods, exposed as
+        // AndroidFS_native. LWA_SHIM_JS wraps it into window.AndroidFS.
         fsBridge?.let { webView.addJavascriptInterface(it, "AndroidFS_native") }
 
         webView.webViewClient = object : WebViewClient() {
@@ -1053,9 +1108,8 @@ class WebAppActivity : AppCompatActivity() {
             override fun onPageFinished(v: WebView, url: String) {
                 progressBar.visibility = View.GONE
                 // No shim injection here anymore — SimpleServer injects it
-                // inline into every HTML response, so it runs before any
-                // user script. Eliminates the race condition where sync
-                // code at module top couldn't see window.AndroidFS.
+                // inline into every HTML response, so it's available before
+                // any user script runs.
             }
             override fun onReceivedError(v: WebView, req: WebResourceRequest, err: WebResourceError) {
                 if (req.isForMainFrame) {
@@ -1311,22 +1365,21 @@ class SimpleServer(
     private val executor = Executors.newCachedThreadPool()
     @Volatile private var active = false
 
-    // Precompute the <meta> + <script> block once. Wrapped in
-    // __lwa-injected comments so it's easy to spot in devtools.
+    // Precompute the <meta> + <script> block once.
     private val injectedHead: ByteArray by lazy {
-        buildString {
-            append("<meta name=\"lwa-features\" content=\"fs,audio,share,vibrate\">\n")
-            append("<meta name=\"lwa-version\" content=\"v3\">\n")
-            append("<script data-lwa=\"shim\">")
-            append(shimJs)
-            append("</script>\n")
-        }.toByteArray(Charsets.UTF_8)
+        val sb = StringBuilder()
+        sb.append("<meta name=\"lwa-features\" content=\"fs,audio,share,vibrate\">\n")
+        sb.append("<meta name=\"lwa-version\" content=\"v3\">\n")
+        sb.append("<script data-lwa=\"shim\">")
+        sb.append(shimJs)
+        sb.append("</script>\n")
+        sb.toString().toByteArray(Charsets.UTF_8)
     }
 
     fun start() {
         // Try a stable port derived from the SAF URI hash so OPFS and
-        // localStorage persist across launches. If the port is taken,
-        // fall back to next 10 consecutive ports, then to random.
+        // localStorage persist across launches. If the port is taken, try
+        // the next 10 consecutive ports, then fall back to random.
         val basePort = 39000 + (Math.abs(rootUri.toString().hashCode()) % 1000)
         var bound = false
         for (offset in 0..10) {
@@ -1337,7 +1390,7 @@ class SimpleServer(
                 android.util.Log.d("LWA-Server", "Bound stable port $port for $rootUri")
                 break
             } catch (e: Exception) {
-                // port in use or blocked, try the next
+                // port in use, try the next
             }
         }
         if (!bound) {
@@ -1406,9 +1459,8 @@ class SimpleServer(
         val name = file.name ?: ""
         val mime = getMime(name)
 
-        // If this is HTML, rewrite it to inject the shim script inline
-        // at the very top of <head>. This guarantees the bridges are
-        // available before any user script — no race conditions.
+        // If this is HTML, rewrite it to inject the shim at the top of
+        // <head>. Guarantees bridges are available before any user script.
         val bytes = if (mime.startsWith("text/html")) injectShim(originalBytes) else originalBytes
 
         val header = "HTTP/1.1 200 OK\r\nContent-Type: $mime\r\n" +
@@ -1419,14 +1471,9 @@ class SimpleServer(
     }
 
     /**
-     * Inject the shim script at the very top of <head> in an HTML document.
+     * Inject the shim script at the top of <head> in an HTML document.
      * If <head> doesn't exist, insert one after <html>. If <html> doesn't
-     * exist either, prepend to the document (rare, but handled).
-     *
-     * Done with a simple case-insensitive string search — no HTML parser
-     * needed. We're only looking for well-formed documents; malformed HTML
-     * falls through with no injection (web app still works, just without
-     * the shim).
+     * exist either, prepend to the document.
      */
     private fun injectShim(html: ByteArray): ByteArray {
         val text = try { String(html, Charsets.UTF_8) }
@@ -1435,7 +1482,6 @@ class SimpleServer(
         val lower = text.lowercase()
         val headIdx = lower.indexOf("<head")
         if (headIdx >= 0) {
-            // Find end of opening <head ...> tag
             val tagEnd = text.indexOf('>', headIdx)
             if (tagEnd > 0) {
                 val before = text.substring(0, tagEnd + 1).toByteArray(Charsets.UTF_8)
@@ -1449,7 +1495,6 @@ class SimpleServer(
             }
         }
 
-        // No <head> tag — try to create one just after <html>
         val htmlIdx = lower.indexOf("<html")
         if (htmlIdx >= 0) {
             val tagEnd = text.indexOf('>', htmlIdx)
@@ -1467,7 +1512,6 @@ class SimpleServer(
             }
         }
 
-        // Not recognizable HTML — prepend and hope for the best
         val prefix = ("<head>" + String(injectedHead, Charsets.UTF_8) + "</head>")
             .toByteArray(Charsets.UTF_8)
         val result = ByteArray(prefix.size + html.size)
