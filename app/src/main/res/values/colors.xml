@@ -5,15 +5,17 @@
     <color name="couch_blue">#3B82F6</color>
     <color name="couch_blue_deep">#2563EB</color>
 
-    <color name="bg_dark">#0A0A0F</color>
-    <color name="bg_surface">#14141B</color>
-    <color name="bg_elevated">#1C1C26</color>
+    <!-- bg_dark now matches the logo panel background so the wordmark
+         lockup (which includes its original background) sits flush. -->
+    <color name="bg_dark">#0F1626</color>
+    <color name="bg_surface">#151E33</color>
+    <color name="bg_elevated">#1D2843</color>
 
     <color name="text_primary">#F5F5F7</color>
     <color name="text_secondary">#9CA3AF</color>
     <color name="text_disabled">#4B5563</color>
 
-    <color name="divider">#2A2A35</color>
+    <color name="divider">#2A3552</color>
 
     <color name="accent_error">#EF4444</color>
     <color name="accent_success">#10B981</color>
