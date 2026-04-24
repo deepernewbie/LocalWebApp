@@ -1,32 +1,4 @@
-name: Build CouchFlow APK
-
-on:
-  push:
-    branches: [ main, master ]
-  workflow_dispatch:
-
-jobs:
-  build:
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-
-      - name: Set up JDK 17
-        uses: actions/setup-java@v4
-        with:
-          java-version: '17'
-          distribution: 'temurin'
-
-      - name: Set up Android SDK
-        uses: android-actions/setup-android@v3
-
-      - name: Install image tools
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y python3-pil python3-numpy
-
-      - name: Generate visual assets from logo.png
+- name: Generate visual assets from logo.png
         run: |
           python3 << 'PYEOF'
           from PIL import Image, ImageDraw
@@ -35,42 +7,34 @@ jobs:
 
           SRC = 'icon/logo.png'
           if not os.path.exists(SRC):
-              raise SystemExit(f"ERROR: {SRC} not found. Upload the logo sheet to icon/logo.png")
+              raise SystemExit(f"ERROR: {SRC} not found.")
 
           RES = 'app/src/main/res'
-          PANEL_COLOR = (15, 22, 38, 255)
+          PANEL_COLOR = (15, 22, 38, 255)  # #0F1626
 
           im = Image.open(SRC).convert('RGB')
           w, h = im.size
-          print(f"source: {w}x{h}")
-
           sx = w / 1536
           sy = h / 1024
+
+          # ========== Wordmark lockup (from dark-panel version) ==========
           panel = im.crop((int(800*sx), int(640*sy), int(1500*sx), int(860*sy)))
           panel_arr = np.array(panel)
-
           ref = np.array([15, 22, 38])
           diff = np.abs(panel_arr.astype(int) - ref).sum(axis=2)
           content = diff > 40
           ys, xs = np.where(content)
           if len(xs) == 0:
-              raise SystemExit("Could not locate lockup content in logo.png")
+              raise SystemExit("Could not locate lockup")
           x1, x2 = xs.min(), xs.max()
           y1, y2 = ys.min(), ys.max()
           pad = 8
-          lockup = panel.crop((max(0, x1 - pad),
-                               max(0, y1 - pad),
-                               min(panel.width,  x2 + pad),
+          lockup = panel.crop((max(0, x1 - pad), max(0, y1 - pad),
+                               min(panel.width, x2 + pad),
                                min(panel.height, y2 + pad)))
-          print(f"extracted lockup: {lockup.size}")
+          print(f"lockup: {lockup.size}")
 
-          wm_densities = {
-              'mdpi':     40,
-              'hdpi':     60,
-              'xhdpi':    80,
-              'xxhdpi':  120,
-              'xxxhdpi': 160,
-          }
+          wm_densities = {'mdpi': 40, 'hdpi': 60, 'xhdpi': 80, 'xxhdpi': 120, 'xxxhdpi': 160}
           for name, hh in wm_densities.items():
               ww = int(lockup.width * (hh / lockup.height))
               d = f'{RES}/drawable-{name}'
@@ -78,22 +42,28 @@ jobs:
               lockup.resize((ww, hh), Image.LANCZOS).save(f'{d}/logo_wordmark.png')
               print(f"Wordmark {name}: {ww}x{hh}")
 
+          # ========== Couch mark for launcher (from light version) ==========
+          # Extract mark, make white transparent, recolor </> glyph to white
+          # so it shows up on the dark launcher tile.
           mark = im.crop((int(200*sx), int(245*sy), int(615*sx), int(430*sy)))
-          mark_rgba = mark.convert('RGBA')
-          mpix = mark_rgba.load()
-          for py in range(mark_rgba.height):
-              for px in range(mark_rgba.width):
-                  r, g, b, a = mpix[px, py]
-                  if r > 240 and g > 240 and b > 240:
-                      mpix[px, py] = (0, 0, 0, 0)
+          rgba = mark.convert('RGBA')
+          arr = np.array(rgba)
+          # White → transparent
+          white_mask = (arr[:,:,0] > 240) & (arr[:,:,1] > 240) & (arr[:,:,2] > 240)
+          arr[white_mask, 3] = 0
+          # Near-white → partial transparency (anti-aliasing)
+          near_white = (arr[:,:,0] > 220) & (arr[:,:,1] > 220) & (arr[:,:,2] > 220) & (~white_mask)
+          brightness = (arr[near_white, 0].astype(int) + arr[near_white, 1] + arr[near_white, 2]) / 3
+          arr[near_white, 3] = (255 - (brightness - 220) / 20 * 255).clip(0, 255).astype('uint8')
+          # Dark pixels (</>) → recolor to white so they show on dark tile
+          dark = (arr[:,:,3] > 50) & (arr[:,:,0] < 80) & (arr[:,:,1] < 80) & (arr[:,:,2] < 80)
+          arr[dark, 0] = 255
+          arr[dark, 1] = 255
+          arr[dark, 2] = 255
+          mark_rgba = Image.fromarray(arr, 'RGBA')
+          print(f"mark with </> recolored white: {mark_rgba.size}")
 
-          densities = {
-              'mdpi':    48,
-              'hdpi':    72,
-              'xhdpi':   96,
-              'xxhdpi':  144,
-              'xxxhdpi': 192,
-          }
+          densities = {'mdpi': 48, 'hdpi': 72, 'xhdpi': 96, 'xxhdpi': 144, 'xxxhdpi': 192}
 
           def make_icon(size, circular=False):
               bg = Image.new('RGBA', (size, size), (0, 0, 0, 0))
@@ -144,38 +114,3 @@ jobs:
 
           print("All visual assets generated.")
           PYEOF
-
-      - name: Install Gradle 8.2
-        uses: gradle/actions/setup-gradle@v3
-        with:
-          gradle-version: '8.2'
-
-      - name: Generate signing keystore
-        run: |
-          keytool -genkey -v \
-            -keystore app/debug.keystore \
-            -storepass android \
-            -alias androiddebugkey \
-            -keypass android \
-            -keyalg RSA \
-            -keysize 2048 \
-            -validity 10000 \
-            -dname "CN=CouchFlow, OU=CouchFlow, O=CouchFlow, L=Couch, S=LR, C=US"
-
-      - name: Build Release APK
-        run: |
-          gradle wrapper --gradle-version=8.2
-          chmod +x ./gradlew
-          ./gradlew assembleRelease --no-daemon
-
-      - name: Rename APK
-        run: |
-          cp app/build/outputs/apk/release/CouchFlow-release.apk CouchFlow-${{ github.sha }}.apk 2>/dev/null || \
-          cp app/build/outputs/apk/release/app-release.apk       CouchFlow-${{ github.sha }}.apk
-
-      - name: Upload signed APK
-        uses: actions/upload-artifact@v4
-        with:
-          name: CouchFlow-release
-          path: CouchFlow-*.apk
-          retention-days: 30
