@@ -1,4 +1,6 @@
-<?xml version="1.0" encoding="utf-8"?>
 <resources>
-    <string name="app_name">Local Web App Runner</string>
+    <string name="app_name">CouchFlow</string>
+    <string name="fab_description">Add web app</string>
+    <string name="delete_description">Delete project</string>
+    <string name="shortcut_description">Pin to home screen</string>
 </resources>
