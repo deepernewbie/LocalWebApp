@@ -1009,14 +1009,17 @@ class WebAppActivity : AppCompatActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
 
-        // Edge-to-edge: draw behind status and nav bars so the status bar
-        // can adopt the web app's theme color. But apply the navigation-bar
-        // inset as bottom padding on the WebView — that way the web app's
-        // layout viewport ends at the gesture bar, NOT under it, so any
-        // button positioned at bottom:24px is clickable.
-        WindowCompat.setDecorFitsSystemWindows(window, false)
-        window.statusBarColor     = android.graphics.Color.TRANSPARENT
-        window.navigationBarColor = android.graphics.Color.TRANSPARENT
+        // Do NOT go edge-to-edge. The status bar (top) and navigation /
+        // gesture bar (bottom) keep their own space. The WebView fills
+        // only the safe area between them — so the web app's `top: 0`
+        // sits just under the status bar and `bottom: 24px` sits just
+        // above the gesture bar. No overlap, no clipping.
+        //
+        // syncStatusBarToWebView() is still called on page load and it
+        // tints both bars to the web app's theme color — so visually the
+        // screen still looks unified from top to bottom, just without
+        // any content getting hidden behind the system UI.
+        WindowCompat.setDecorFitsSystemWindows(window, true)
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
             window.isStatusBarContrastEnforced     = false
             window.isNavigationBarContrastEnforced = false
@@ -1034,18 +1037,6 @@ class WebAppActivity : AppCompatActivity() {
         errorView   = findViewById(R.id.errorView)
         errorText   = findViewById(R.id.errorText)
         progressBar.visibility = View.VISIBLE
-
-        // Handle window insets so the web app's viewport respects the
-        // status bar (top) and gesture/nav bar (bottom). This is the fix
-        // for "bottom button cut off" — Samsung gesture bar inset is
-        // passed to the WebView as padding, shrinking its layout viewport
-        // by exactly the inset height.
-        val webViewContainer = findViewById<View>(R.id.webView)
-        ViewCompat.setOnApplyWindowInsetsListener(webViewContainer) { v, insets ->
-            val sys = insets.getInsets(WindowInsetsCompat.Type.systemBars())
-            v.updatePadding(top = sys.top, bottom = sys.bottom)
-            insets
-        }
 
         val neededPerms = mutableListOf<String>()
         if (checkSelfPermission(android.Manifest.permission.RECORD_AUDIO)
@@ -1434,7 +1425,7 @@ class WebAppActivity : AppCompatActivity() {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// SimpleServer — HTTP server with stable port and HTML shim injection
+// SimpleServer
 // ═══════════════════════════════════════════════════════════════════════════════
 class SimpleServer(
     private val resolver: ContentResolver,
@@ -1470,7 +1461,6 @@ class SimpleServer(
                 android.util.Log.d("CouchFlow-Server", "Bound stable port $port for $rootUri")
                 break
             } catch (e: Exception) {
-                // port in use, try next
             }
         }
         if (!bound) {
