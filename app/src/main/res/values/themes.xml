@@ -2,7 +2,12 @@
     <style name="Theme.CouchFlow" parent="Theme.Material3.DayNight.NoActionBar">
         <item name="colorPrimary">@color/couch_purple</item>
         <item name="colorOnPrimary">#FFFFFF</item>
+        <item name="colorPrimaryContainer">@color/bg_elevated</item>
+        <item name="colorOnPrimaryContainer">@color/text_primary</item>
         <item name="colorSecondary">@color/couch_blue</item>
+        <item name="colorOnSecondary">#FFFFFF</item>
+        <item name="colorSurface">@color/bg_surface</item>
+        <item name="colorOnSurface">@color/text_primary</item>
         <item name="android:colorBackground">@color/bg_dark</item>
         <item name="android:windowBackground">@color/bg_dark</item>
         <item name="android:statusBarColor">@color/bg_dark</item>
@@ -11,12 +16,14 @@
         <item name="android:windowLightNavigationBar">false</item>
     </style>
 
-    <!-- WebApp theme: transparent status/nav bar so the web app's
-         theme-color meta or body background can tint it. -->
+    <!-- WebAppActivity runs edge-to-edge; Kotlin tints the bars to match
+         the current page. Start transparent so there's no flash of wrong
+         color on first paint. -->
     <style name="Theme.CouchFlow.WebApp" parent="Theme.CouchFlow">
         <item name="android:statusBarColor">@android:color/transparent</item>
         <item name="android:navigationBarColor">@android:color/transparent</item>
         <item name="android:windowTranslucentStatus">false</item>
         <item name="android:windowTranslucentNavigation">false</item>
+        <item name="android:windowDrawsSystemBarBackgrounds">true</item>
     </style>
 </resources>
