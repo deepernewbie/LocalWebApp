@@ -3,6 +3,6 @@
     <string name="fab_description">Add web app</string>
     <string name="delete_description">Delete project</string>
     <string name="shortcut_description">Pin to home screen</string>
-    <string name="empty_title">No web apps yet</string>
-    <string name="empty_subtitle">Tap + to pick a folder containing index.html</string>
+    <string name="empty_title">No projects yet</string>
+    <string name="empty_subtitle">Tap + to open a web app folder</string>
 </resources>
