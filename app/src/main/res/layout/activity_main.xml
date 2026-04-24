@@ -21,7 +21,9 @@
             android:layout_height="?attr/actionBarSize"
             android:background="@color/bg_dark"
             app:contentInsetStart="16dp"
-            app:contentInsetStartWithNavigation="16dp">
+            app:contentInsetStartWithNavigation="16dp"
+            app:title=""
+            app:titleTextColor="@android:color/transparent">
 
             <ImageView
                 android:layout_width="wrap_content"
@@ -42,7 +44,7 @@
         android:background="@color/bg_dark"
         android:clipToPadding="false"
         android:paddingTop="8dp"
-        android:paddingBottom="96dp"
+        android:paddingBottom="128dp"
         app:layout_behavior="@string/appbar_scrolling_view_behavior" />
 
     <LinearLayout
@@ -79,12 +81,13 @@
         android:layout_width="wrap_content"
         android:layout_height="wrap_content"
         android:layout_gravity="bottom|end"
-        android:layout_margin="24dp"
-        android:layout_marginBottom="32dp"
+        android:layout_marginStart="24dp"
+        android:layout_marginEnd="24dp"
+        android:layout_marginTop="24dp"
+        android:layout_marginBottom="48dp"
         android:contentDescription="@string/fab_description"
         android:src="@android:drawable/ic_input_add"
         app:backgroundTint="@color/couch_purple"
-        app:tint="#FFFFFF"
-        app:layout_dodgeInsetEdges="bottom" />
+        app:tint="#FFFFFF" />
 
 </androidx.coordinatorlayout.widget.CoordinatorLayout>
