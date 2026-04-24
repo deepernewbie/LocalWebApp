@@ -18,6 +18,7 @@ import android.view.KeyEvent
 import android.view.LayoutInflater
 import android.view.View
 import android.view.ViewGroup
+import android.view.WindowManager
 import android.webkit.*
 import android.widget.ProgressBar
 import android.widget.TextView
@@ -28,6 +29,8 @@ import androidx.appcompat.app.AppCompatActivity
 import androidx.core.content.pm.ShortcutInfoCompat
 import androidx.core.content.pm.ShortcutManagerCompat
 import androidx.core.graphics.drawable.IconCompat
+import androidx.core.view.WindowCompat
+import androidx.core.view.WindowInsetsControllerCompat
 import androidx.documentfile.provider.DocumentFile
 import androidx.recyclerview.widget.LinearLayoutManager
 import androidx.recyclerview.widget.RecyclerView
@@ -94,7 +97,7 @@ class MainActivity : AppCompatActivity() {
     private lateinit var recyclerView: RecyclerView
     private lateinit var adapter: RecentProjectsAdapter
     private lateinit var emptyView: View
-    private val prefs by lazy { getSharedPreferences("LocalWebApp", MODE_PRIVATE) }
+    private val prefs by lazy { getSharedPreferences("CouchFlow", MODE_PRIVATE) }
 
     private val openFolderLauncher =
         registerForActivityResult(ActivityResultContracts.OpenDocumentTree()) { uri ->
@@ -198,7 +201,7 @@ class MainActivity : AppCompatActivity() {
             putExtra("title", project.name)
             addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TASK)
         }
-        val iconBitmap = makeLetterIcon(project.name.firstOrNull()?.uppercase() ?: "W")
+        val iconBitmap = makeLetterIcon(project.name.firstOrNull()?.uppercase() ?: "C")
         val shortcut = ShortcutInfoCompat.Builder(this, "webapp_${project.uri.hashCode()}")
             .setShortLabel(project.name.take(24))
             .setLongLabel(project.name.take(48))
@@ -213,11 +216,16 @@ class MainActivity : AppCompatActivity() {
         val size    = 192
         val bitmap  = Bitmap.createBitmap(size, size, Bitmap.Config.ARGB_8888)
         val canvas  = Canvas(bitmap)
+        // CouchFlow brand palette — purple to blue gradient-ish color family.
         val colors  = listOf(
-            Color.parseColor("#6366F1"), Color.parseColor("#EC4899"),
-            Color.parseColor("#10B981"), Color.parseColor("#F59E0B"),
-            Color.parseColor("#EF4444"), Color.parseColor("#8B5CF6"),
-            Color.parseColor("#06B6D4"), Color.parseColor("#F97316")
+            Color.parseColor("#8B5CF6"), // couch purple
+            Color.parseColor("#7C3AED"),
+            Color.parseColor("#6366F1"),
+            Color.parseColor("#3B82F6"), // couch blue
+            Color.parseColor("#2563EB"),
+            Color.parseColor("#06B6D4"),
+            Color.parseColor("#EC4899"),
+            Color.parseColor("#10B981")
         )
         val color = colors[Math.abs(letter.hashCode()) % colors.size]
         val bgPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply { this.color = color }
@@ -423,8 +431,6 @@ class NativeAudioRecorder {
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // JsFilesystemBridge — exposed as AndroidFS_native
-// All methods use block bodies (not expression bodies) so early `return`
-// statements inside try/catch compile correctly.
 // ═══════════════════════════════════════════════════════════════════════════════
 class JsFilesystemBridge(
     private val ctx: android.content.Context,
@@ -459,7 +465,7 @@ class JsFilesystemBridge(
             resolver.openInputStream(file.uri)?.use { it.readBytes() }
                 ?.toString(Charsets.UTF_8)
         } catch (e: Exception) {
-            android.util.Log.e("LWA-FS", "read $path: ${e.message}")
+            android.util.Log.e("CF-FS", "read $path: ${e.message}")
             null
         }
     }
@@ -474,7 +480,7 @@ class JsFilesystemBridge(
             stream.use { it.write(bytes) }
             "ok"
         } catch (e: Exception) {
-            android.util.Log.e("LWA-FS", "write $path: ${e.message}")
+            android.util.Log.e("CF-FS", "write $path: ${e.message}")
             "error:${e.message}"
         }
     }
@@ -582,34 +588,36 @@ class WebAppActivity : AppCompatActivity() {
         private const val NET_CACHE = "netcache"
 
         /**
-         * Combined LWA shim v3. Injected inline at the top of <head> by
+         * CouchFlow shim v3. Injected inline at the top of <head> by
          * SimpleServer so it runs BEFORE any user script executes.
          *
          * Exposes:
          *   window.LWA              — { version, features, ready, isNative }
+         *   window.CouchFlow        — alias of window.LWA for brand-aware apps
          *   window.AndroidFS        — Promise-based file API
          *   Patched getUserMedia / MediaRecorder / AnalyserNode
          *   Patched fetch() for PUT/POST/DELETE to same-origin → disk
          *
-         * Kotlin-side @JavascriptInterface bindings (Android, AndroidFS_native)
-         * are injected at DidClearWindowObject time, BEFORE the HTML is
-         * parsed, so they're already available when this inline script runs.
+         * The brand alias is optional; the canonical names remain `LWA` and
+         * `AndroidFS` so existing web apps keep working unchanged.
          */
         private const val LWA_SHIM_JS = """
 (function(){
-  if (window.__lwa_shim_v3) return;
-  window.__lwa_shim_v3 = true;
+  if (window.__couchflow_shim_v3) return;
+  window.__couchflow_shim_v3 = true;
 
   var features = [];
   var readyResolve;
   var readyPromise = new Promise(function(r){ readyResolve = r; });
 
-  window.LWA = {
+  var lwaObj = {
     version:  'v3',
     features: features,
     ready:    readyPromise,
     isNative: typeof Android !== 'undefined' && typeof Android.isNativeApp === 'function'
   };
+  window.LWA = lwaObj;
+  window.CouchFlow = lwaObj;
 
   // ──── AUDIO SHIM ────────────────────────────────────────────────────────
   if (typeof Android !== 'undefined' && typeof Android.recStart === 'function') {
@@ -622,7 +630,7 @@ class WebAppActivity : AppCompatActivity() {
 
     function makeTrack() {
       return {
-        kind:'audio', id:'lwa-track-'+Math.random().toString(36).slice(2),
+        kind:'audio', id:'cf-track-'+Math.random().toString(36).slice(2),
         label:'Native Android Microphone',
         enabled:true, muted:false, readyState:'live', contentHint:'',
         stop: function(){ this.readyState='ended'; this.enabled=false; },
@@ -635,7 +643,7 @@ class WebAppActivity : AppCompatActivity() {
       };
     }
     function NativeStream() {
-      this.id = 'lwa-stream-' + Math.random().toString(36).slice(2);
+      this.id = 'cf-stream-' + Math.random().toString(36).slice(2);
       this.active = true; this.__lwa = true;
       this._tracks = [makeTrack()];
     }
@@ -890,7 +898,6 @@ class WebAppActivity : AppCompatActivity() {
       }
     };
 
-    // Patch fetch() for same-origin PUT/POST/DELETE → disk writes
     var origFetch = window.fetch ? window.fetch.bind(window) : null;
     window.fetch = function(input, init) {
       var url = (typeof input === 'string') ? input : (input && input.url);
@@ -936,18 +943,16 @@ class WebAppActivity : AppCompatActivity() {
     };
   }
 
-  // ──── FEATURE FLAGS ─────────────────────────────────────────────────────
   if (typeof Android !== 'undefined') {
     features.push('share', 'vibrate', 'toast');
   }
 
-  // ──── SIGNAL READY ──────────────────────────────────────────────────────
   readyResolve({
     features: features.slice(),
     version:  'v3',
-    isNative: window.LWA.isNative
+    isNative: lwaObj.isNative
   });
-  console.log('[LWA] shim v3 ready — features:', features.join(','));
+  console.log('[CouchFlow] shim v3 ready — features:', features.join(','));
 })();
 """
     }
@@ -1008,6 +1013,19 @@ class WebAppActivity : AppCompatActivity() {
     @SuppressLint("SetJavaScriptEnabled")
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+
+        // Edge-to-edge: draw behind status bar and nav bar. The web app
+        // paints its own background all the way to the edges, and we tint
+        // the bars to match whatever color the page requests (via meta
+        // theme-color or body background).
+        WindowCompat.setDecorFitsSystemWindows(window, false)
+        window.statusBarColor     = android.graphics.Color.TRANSPARENT
+        window.navigationBarColor = android.graphics.Color.TRANSPARENT
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            window.isStatusBarContrastEnforced     = false
+            window.isNavigationBarContrastEnforced = false
+        }
+
         supportActionBar?.hide()
         setContentView(R.layout.activity_webapp)
 
@@ -1041,6 +1059,78 @@ class WebAppActivity : AppCompatActivity() {
         webView.loadUrl("http://localhost:${s.port}/")
     }
 
+    /**
+     * Tint the status and navigation bars to match the web app's color.
+     *
+     * Strategy:
+     *   1. If <meta name="theme-color"> is present, use that.
+     *   2. Otherwise use computed background-color of document.body.
+     *   3. Adjust icon contrast (light vs dark) based on color luminance.
+     *
+     * Called after onPageFinished and after any in-app navigation.
+     */
+    private fun syncStatusBarToWebView() {
+        val js = """
+            (function(){
+              try {
+                var meta = document.querySelector('meta[name="theme-color"]');
+                if (meta && meta.content) return meta.content.trim();
+                var bg = getComputedStyle(document.body).backgroundColor;
+                if (bg && bg !== 'rgba(0, 0, 0, 0)' && bg !== 'transparent') return bg;
+                var htmlBg = getComputedStyle(document.documentElement).backgroundColor;
+                if (htmlBg && htmlBg !== 'rgba(0, 0, 0, 0)' && htmlBg !== 'transparent') return htmlBg;
+                return '#000000';
+              } catch(e) { return '#000000'; }
+            })();
+        """.trimIndent()
+        webView.evaluateJavascript(js) { raw ->
+            val colorStr = raw?.trim()?.removeSurrounding("\"") ?: "#000000"
+            val parsed = parseCssColor(colorStr) ?: return@evaluateJavascript
+            runOnUiThread { applyBarColor(parsed) }
+        }
+    }
+
+    /**
+     * Parse either #RRGGBB / #RGB / rgb(r,g,b) / rgba(r,g,b,a) into an ARGB int.
+     */
+    private fun parseCssColor(css: String): Int? {
+        val s = css.trim()
+        try {
+            if (s.startsWith("#")) {
+                return android.graphics.Color.parseColor(s)
+            }
+            if (s.startsWith("rgb")) {
+                // e.g. rgb(20, 20, 27) or rgba(20, 20, 27, 1)
+                val inside = s.substringAfter('(').substringBefore(')')
+                val parts  = inside.split(',').map { it.trim() }
+                if (parts.size >= 3) {
+                    val r = parts[0].toFloat().toInt().coerceIn(0, 255)
+                    val g = parts[1].toFloat().toInt().coerceIn(0, 255)
+                    val b = parts[2].toFloat().toInt().coerceIn(0, 255)
+                    return android.graphics.Color.rgb(r, g, b)
+                }
+            }
+            // Named colors (black, white, etc) — rare, but supported
+            return android.graphics.Color.parseColor(s)
+        } catch (e: Exception) {
+            return null
+        }
+    }
+
+    private fun applyBarColor(color: Int) {
+        window.statusBarColor     = color
+        window.navigationBarColor = color
+        // If background is light, use dark icons; otherwise light icons.
+        val r = android.graphics.Color.red(color)
+        val g = android.graphics.Color.green(color)
+        val b = android.graphics.Color.blue(color)
+        val luminance = (0.299 * r + 0.587 * g + 0.114 * b) / 255.0
+        val useDarkIcons = luminance > 0.5
+        val controller = WindowInsetsControllerCompat(window, window.decorView)
+        controller.isAppearanceLightStatusBars     = useDarkIcons
+        controller.isAppearanceLightNavigationBars = useDarkIcons
+    }
+
     @SuppressLint("SetJavaScriptEnabled")
     private fun setupWebView() {
         webView.settings.apply {
@@ -1056,12 +1146,15 @@ class WebAppActivity : AppCompatActivity() {
             mediaPlaybackRequiresUserGesture = false
             mixedContentMode = WebSettings.MIXED_CONTENT_COMPATIBILITY_MODE
         }
+        // Default background: solid black so if the page loads slowly
+        // there's no white flash at the top/bottom edges.
+        webView.setBackgroundColor(android.graphics.Color.BLACK)
 
         webView.addJavascriptInterface(object : Any() {
             @JavascriptInterface fun toast(msg: String) = runOnUiThread {
                 Toast.makeText(this@WebAppActivity, msg, Toast.LENGTH_SHORT).show()
             }
-            @JavascriptInterface fun log(msg: String) = android.util.Log.d("WebApp", msg)
+            @JavascriptInterface fun log(msg: String) = android.util.Log.d("CouchFlow", msg)
             @JavascriptInterface fun isNativeApp() = true
             @JavascriptInterface fun getPlatform() = "android"
             @JavascriptInterface fun getAppVersion(): String =
@@ -1085,7 +1178,6 @@ class WebAppActivity : AppCompatActivity() {
                 } catch (e: Exception) { "0" }
             }
 
-            // Audio bridge (used by LWA_SHIM_JS)
             @JavascriptInterface fun recStart():  String  = nativeRecorder.start()
             @JavascriptInterface fun recStop():   String  = nativeRecorder.stop()
             @JavascriptInterface fun recPause():  String  = nativeRecorder.pauseRecording()
@@ -1094,10 +1186,19 @@ class WebAppActivity : AppCompatActivity() {
             @JavascriptInterface fun recWaveform(count: Int): String = nativeRecorder.getWaveform(count)
             @JavascriptInterface fun recIsActive(): Boolean = nativeRecorder.isActive()
             @JavascriptInterface fun recIsPaused(): Boolean = nativeRecorder.isPausedState()
+
+            /**
+             * Web apps can call this to explicitly set the bar color at
+             * runtime, e.g. when switching themes within the app without
+             * triggering a page reload.
+             *   Android.setBarColor('#14141B')
+             */
+            @JavascriptInterface fun setBarColor(cssColor: String) {
+                val parsed = parseCssColor(cssColor) ?: return
+                runOnUiThread { applyBarColor(parsed) }
+            }
         }, "Android")
 
-        // FS bridge — class with @JavascriptInterface methods, exposed as
-        // AndroidFS_native. LWA_SHIM_JS wraps it into window.AndroidFS.
         fsBridge?.let { webView.addJavascriptInterface(it, "AndroidFS_native") }
 
         webView.webViewClient = object : WebViewClient() {
@@ -1107,9 +1208,8 @@ class WebAppActivity : AppCompatActivity() {
             }
             override fun onPageFinished(v: WebView, url: String) {
                 progressBar.visibility = View.GONE
-                // No shim injection here anymore — SimpleServer injects it
-                // inline into every HTML response, so it's available before
-                // any user script runs.
+                // Read theme-color / body bg and tint the bars to match.
+                syncStatusBarToWebView()
             }
             override fun onReceivedError(v: WebView, req: WebResourceRequest, err: WebResourceError) {
                 if (req.isForMainFrame) {
@@ -1164,7 +1264,7 @@ class WebAppActivity : AppCompatActivity() {
                 if (p == 100) progressBar.visibility = View.GONE
             }
             override fun onConsoleMessage(m: ConsoleMessage): Boolean {
-                android.util.Log.d("WebApp-JS",
+                android.util.Log.d("CouchFlow-JS",
                     "[${m.messageLevel()}] ${m.message()} (line ${m.lineNumber()})")
                 return true
             }
@@ -1365,21 +1465,18 @@ class SimpleServer(
     private val executor = Executors.newCachedThreadPool()
     @Volatile private var active = false
 
-    // Precompute the <meta> + <script> block once.
     private val injectedHead: ByteArray by lazy {
         val sb = StringBuilder()
         sb.append("<meta name=\"lwa-features\" content=\"fs,audio,share,vibrate\">\n")
         sb.append("<meta name=\"lwa-version\" content=\"v3\">\n")
-        sb.append("<script data-lwa=\"shim\">")
+        sb.append("<meta name=\"couchflow-version\" content=\"v3\">\n")
+        sb.append("<script data-couchflow=\"shim\">")
         sb.append(shimJs)
         sb.append("</script>\n")
         sb.toString().toByteArray(Charsets.UTF_8)
     }
 
     fun start() {
-        // Try a stable port derived from the SAF URI hash so OPFS and
-        // localStorage persist across launches. If the port is taken, try
-        // the next 10 consecutive ports, then fall back to random.
         val basePort = 39000 + (Math.abs(rootUri.toString().hashCode()) % 1000)
         var bound = false
         for (offset in 0..10) {
@@ -1387,7 +1484,7 @@ class SimpleServer(
                 serverSocket = ServerSocket(basePort + offset)
                 port = basePort + offset
                 bound = true
-                android.util.Log.d("LWA-Server", "Bound stable port $port for $rootUri")
+                android.util.Log.d("CouchFlow-Server", "Bound stable port $port for $rootUri")
                 break
             } catch (e: Exception) {
                 // port in use, try the next
@@ -1395,7 +1492,7 @@ class SimpleServer(
         }
         if (!bound) {
             serverSocket = ServerSocket(0).also { port = it.localPort }
-            android.util.Log.w("LWA-Server", "Stable port unavailable, using random $port")
+            android.util.Log.w("CouchFlow-Server", "Stable port unavailable, using random $port")
         }
 
         active = true
@@ -1459,8 +1556,6 @@ class SimpleServer(
         val name = file.name ?: ""
         val mime = getMime(name)
 
-        // If this is HTML, rewrite it to inject the shim at the top of
-        // <head>. Guarantees bridges are available before any user script.
         val bytes = if (mime.startsWith("text/html")) injectShim(originalBytes) else originalBytes
 
         val header = "HTTP/1.1 200 OK\r\nContent-Type: $mime\r\n" +
@@ -1470,11 +1565,6 @@ class SimpleServer(
         out.write(bytes); out.flush()
     }
 
-    /**
-     * Inject the shim script at the top of <head> in an HTML document.
-     * If <head> doesn't exist, insert one after <html>. If <html> doesn't
-     * exist either, prepend to the document.
-     */
     private fun injectShim(html: ByteArray): ByteArray {
         val text = try { String(html, Charsets.UTF_8) }
                    catch (e: Exception) { return html }
