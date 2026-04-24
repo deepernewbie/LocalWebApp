@@ -3,9 +3,11 @@
     xmlns:android="http://schemas.android.com/apk/res/android"
     xmlns:app="http://schemas.android.com/apk/res-auto"
     xmlns:tools="http://schemas.android.com/tools"
+    android:id="@+id/rootLayout"
     android:layout_width="match_parent"
     android:layout_height="match_parent"
-    android:background="@color/bg_dark">
+    android:background="@color/bg_dark"
+    android:fitsSystemWindows="true">
 
     <com.google.android.material.appbar.AppBarLayout
         android:layout_width="match_parent"
@@ -18,8 +20,18 @@
             android:layout_width="match_parent"
             android:layout_height="?attr/actionBarSize"
             android:background="@color/bg_dark"
-            app:titleTextColor="@color/text_primary"
-            app:title="@string/app_name" />
+            app:contentInsetStart="16dp"
+            app:contentInsetStartWithNavigation="16dp">
+
+            <ImageView
+                android:layout_width="wrap_content"
+                android:layout_height="40dp"
+                android:layout_gravity="start|center_vertical"
+                android:src="@drawable/logo_wordmark"
+                android:contentDescription="@string/app_name"
+                android:adjustViewBounds="true" />
+
+        </androidx.appcompat.widget.Toolbar>
 
     </com.google.android.material.appbar.AppBarLayout>
 
@@ -27,8 +39,10 @@
         android:id="@+id/recyclerView"
         android:layout_width="match_parent"
         android:layout_height="match_parent"
+        android:background="@color/bg_dark"
         android:clipToPadding="false"
-        android:paddingBottom="88dp"
+        android:paddingTop="8dp"
+        android:paddingBottom="96dp"
         app:layout_behavior="@string/appbar_scrolling_view_behavior" />
 
     <LinearLayout
@@ -38,6 +52,7 @@
         android:orientation="vertical"
         android:gravity="center"
         android:visibility="gone"
+        android:background="@color/bg_dark"
         app:layout_behavior="@string/appbar_scrolling_view_behavior"
         tools:visibility="visible">
 
@@ -65,9 +80,11 @@
         android:layout_height="wrap_content"
         android:layout_gravity="bottom|end"
         android:layout_margin="24dp"
+        android:layout_marginBottom="32dp"
         android:contentDescription="@string/fab_description"
         android:src="@android:drawable/ic_input_add"
         app:backgroundTint="@color/couch_purple"
-        app:tint="#FFFFFF" />
+        app:tint="#FFFFFF"
+        app:layout_dodgeInsetEdges="bottom" />
 
 </androidx.coordinatorlayout.widget.CoordinatorLayout>
