@@ -1,4 +1,4 @@
-name: Build APK
+name: Build CouchFlow APK
 
 on:
   push:
@@ -26,15 +26,39 @@ jobs:
         with:
           gradle-version: '8.2'
 
-      - name: Build Debug APK
+      - name: Generate debug keystore for release signing
+        run: |
+          # The release build expects app/debug.keystore to exist. We
+          # generate a throwaway keystore with the standard Android
+          # debug credentials (keystore password "android", alias
+          # "androiddebugkey", same alias password). This lets the
+          # release APK be signed and installable via sideload without
+          # managing production secrets.
+          keytool -genkey -v \
+            -keystore app/debug.keystore \
+            -storepass android \
+            -alias androiddebugkey \
+            -keypass android \
+            -keyalg RSA \
+            -keysize 2048 \
+            -validity 10000 \
+            -dname "CN=CouchFlow, OU=CouchFlow, O=CouchFlow, L=Couch, S=Living Room, C=US"
+
+      - name: Build Release APK
         run: |
           gradle wrapper --gradle-version=8.2
           chmod +x ./gradlew
-          ./gradlew assembleDebug --no-daemon
+          ./gradlew assembleRelease --no-daemon
 
-      - name: Upload APK
+      - name: Rename APK for clarity
+        run: |
+          # Copy the signed release APK to a clearly named file
+          cp app/build/outputs/apk/release/CouchFlow-release.apk CouchFlow-${{ github.sha }}.apk || \
+          cp app/build/outputs/apk/release/app-release.apk       CouchFlow-${{ github.sha }}.apk
+
+      - name: Upload signed release APK
         uses: actions/upload-artifact@v4
         with:
-          name: LocalWebApp-debug
-          path: app/build/outputs/apk/debug/app-debug.apk
+          name: CouchFlow-release
+          path: CouchFlow-*.apk
           retention-days: 30
