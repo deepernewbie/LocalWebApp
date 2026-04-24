@@ -21,77 +21,144 @@ jobs:
       - name: Set up Android SDK
         uses: android-actions/setup-android@v3
 
-      - name: Install ImageMagick for icon generation
-        run: sudo apt-get install -y imagemagick
-
-      - name: Generate launcher icons from logo.png
+      - name: Install image tools
         run: |
-          # The repo has a single source logo at icon/logo.png.
-          # This step generates all the Android density-specific PNGs
-          # that the launcher needs, so we don't have to commit 10
-          # icon files — just the source logo.
-          set -e
-          SRC=icon/logo.png
-          if [ ! -f "$SRC" ]; then
-            echo "ERROR: icon/logo.png not found in repo root"
-            exit 1
-          fi
-          RES=app/src/main/res
+          sudo apt-get update
+          sudo apt-get install -y imagemagick python3-pil fonts-dejavu
 
-          # Standard Android mipmap sizes
-          declare -A SIZES=(
-            [mdpi]=48
-            [hdpi]=72
-            [xhdpi]=96
-            [xxhdpi]=144
-            [xxxhdpi]=192
-          )
+      - name: Generate visual assets from logo.png
+        run: |
+          python3 << 'PYEOF'
+          from PIL import Image, ImageDraw, ImageFont
+          import os
 
-          for DENSITY in "${!SIZES[@]}"; do
-            SIZE=${SIZES[$DENSITY]}
-            DIR=$RES/mipmap-$DENSITY
-            mkdir -p "$DIR"
-            # Square icon for standard launcher
-            convert "$SRC" -resize ${SIZE}x${SIZE} "$DIR/ic_launcher.png"
-            # Round icon: apply circular mask
-            convert "$SRC" -resize ${SIZE}x${SIZE} \
-              \( +clone -threshold -1 -negate -fill white \
-                 -draw "circle $((SIZE/2-1)),$((SIZE/2-1)) $((SIZE/2-1)),0" \) \
-              -alpha off -compose copy_opacity -composite \
-              "$DIR/ic_launcher_round.png"
-            echo "Generated $DENSITY (${SIZE}x${SIZE})"
-          done
+          SRC = 'icon/logo.png'
+          if not os.path.exists(SRC):
+              raise SystemExit(f"ERROR: {SRC} not found. Upload the logo sheet to icon/logo.png")
 
-          # Adaptive icon foreground (API 26+): logo sized to ~66% of 432px
-          mkdir -p $RES/mipmap-xxxhdpi
-          convert "$SRC" -resize 264x264 \
-            -background none -gravity center -extent 432x432 \
-            $RES/mipmap-xxxhdpi/ic_launcher_foreground.png
+          RES = 'app/src/main/res'
+          BG_COLOR = (10, 10, 15, 255)
 
-          # Adaptive icon background — solid dark color
-          mkdir -p $RES/drawable
-          cat > $RES/drawable/ic_launcher_background.xml << 'BG'
-          <vector xmlns:android="http://schemas.android.com/apk/res/android"
-              android:width="108dp" android:height="108dp"
-              android:viewportWidth="108" android:viewportHeight="108">
-              <path android:pathData="M0,0h108v108h-108z" android:fillColor="#0A0A0F" />
-          </vector>
-          BG
+          im = Image.open(SRC).convert('RGBA')
+          w, h = im.size
+          scale_x = w / 1536
+          scale_y = h / 1024
+          x1 = int(200 * scale_x)
+          y1 = int(245 * scale_y)
+          x2 = int(615 * scale_x)
+          y2 = int(430 * scale_y)
+          logo = im.crop((x1, y1, x2, y2))
 
-          # Adaptive icon XML (API 26+)
-          mkdir -p $RES/mipmap-anydpi-v26
-          cat > $RES/mipmap-anydpi-v26/ic_launcher.xml << 'ADA'
-          <?xml version="1.0" encoding="utf-8"?>
-          <adaptive-icon xmlns:android="http://schemas.android.com/apk/res/android">
-              <background android:drawable="@drawable/ic_launcher_background" />
-              <foreground android:drawable="@mipmap/ic_launcher_foreground" />
-          </adaptive-icon>
-          ADA
-          cp $RES/mipmap-anydpi-v26/ic_launcher.xml \
-             $RES/mipmap-anydpi-v26/ic_launcher_round.xml
+          pix = logo.load()
+          for py in range(logo.height):
+              for px in range(logo.width):
+                  r, g, b, a = pix[px, py]
+                  if r > 240 and g > 240 and b > 240:
+                      pix[px, py] = (0, 0, 0, 0)
+          print(f"Extracted logo mark: {logo.size}")
 
-          echo "Icon generation complete"
-          ls -la $RES/mipmap-*/ $RES/drawable/
+          densities = {
+              'mdpi':    48,
+              'hdpi':    72,
+              'xhdpi':   96,
+              'xxhdpi':  144,
+              'xxxhdpi': 192,
+          }
+
+          def make_icon(size, circular=False):
+              bg = Image.new('RGBA', (size, size), (0, 0, 0, 0))
+              mask = Image.new('L', (size, size), 0)
+              d = ImageDraw.Draw(mask)
+              if circular:
+                  d.ellipse((0, 0, size-1, size-1), fill=255)
+              else:
+                  d.rounded_rectangle((0, 0, size-1, size-1),
+                                      radius=int(size * 0.22), fill=255)
+              tile = Image.new('RGBA', (size, size), BG_COLOR)
+              bg.paste(tile, (0, 0), mask)
+              logo_w = int(size * (0.72 if circular else 0.80))
+              ratio  = logo.height / logo.width
+              logo_h = int(logo_w * ratio)
+              lr = logo.resize((logo_w, logo_h), Image.LANCZOS)
+              x = (size - logo_w) // 2
+              y = (size - logo_h) // 2
+              bg.paste(lr, (x, y), lr)
+              return bg
+
+          for name, size in densities.items():
+              d = f'{RES}/mipmap-{name}'
+              os.makedirs(d, exist_ok=True)
+              make_icon(size, False).save(f'{d}/ic_launcher.png')
+              make_icon(size, True ).save(f'{d}/ic_launcher_round.png')
+              print(f"Generated {name}: {size}x{size}")
+
+          fg_size = 432
+          fg_logo_w = int(fg_size * 0.70)
+          ratio = logo.height / logo.width
+          fg_logo_h = int(fg_logo_w * ratio)
+          fg = Image.new('RGBA', (fg_size, fg_size), (0, 0, 0, 0))
+          lr = logo.resize((fg_logo_w, fg_logo_h), Image.LANCZOS)
+          fg.paste(lr, ((fg_size - fg_logo_w) // 2,
+                        (fg_size - fg_logo_h) // 2), lr)
+          fg.save(f'{RES}/mipmap-xxxhdpi/ic_launcher_foreground.png')
+
+          font_path = '/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf'
+          font_size = 95
+          font = ImageFont.truetype(font_path, font_size)
+          tmp = Image.new('RGBA', (1, 1))
+          dr = ImageDraw.Draw(tmp)
+          cb = dr.textbbox((0, 0), 'Couch', font=font)
+          fb = dr.textbbox((0, 0), 'Flow',  font=font)
+          cw = cb[2] - cb[0]
+          fw = fb[2] - fb[0]
+          th = max(cb[3], fb[3])
+
+          mark_h = 120
+          mark_w = int(mark_h * (logo.width / logo.height))
+          gap = 24
+          tw = mark_w + gap + cw + fw + 20
+          tht = max(mark_h, th) + 20
+          canvas = Image.new('RGBA', (tw, tht), (0, 0, 0, 0))
+          mark_resized = logo.resize((mark_w, mark_h), Image.LANCZOS)
+          canvas.paste(mark_resized, (0, (tht - mark_h) // 2), mark_resized)
+          dr2 = ImageDraw.Draw(canvas)
+          ty = (tht - th) // 2 - cb[1]
+          tx = mark_w + gap
+          dr2.text((tx, ty),      'Couch', fill=(245, 245, 247, 255), font=font)
+          dr2.text((tx + cw, ty), 'Flow',  fill=(59, 130, 246, 255),   font=font)
+
+          wm_densities = {
+              'mdpi':     40,
+              'hdpi':     60,
+              'xhdpi':    80,
+              'xxhdpi':  120,
+              'xxxhdpi': 160,
+          }
+          for name, hh in wm_densities.items():
+              ww = int(canvas.width * (hh / canvas.height))
+              d = f'{RES}/drawable-{name}'
+              os.makedirs(d, exist_ok=True)
+              canvas.resize((ww, hh), Image.LANCZOS).save(f'{d}/logo_wordmark.png')
+              print(f"Wordmark {name}: {ww}x{hh}")
+
+          os.makedirs(f'{RES}/drawable', exist_ok=True)
+          with open(f'{RES}/drawable/ic_launcher_background.xml', 'w') as f:
+              f.write('<vector xmlns:android="http://schemas.android.com/apk/res/android" android:width="108dp" android:height="108dp" android:viewportWidth="108" android:viewportHeight="108"><path android:pathData="M0,0h108v108h-108z" android:fillColor="#0A0A0F" /></vector>')
+
+          os.makedirs(f'{RES}/mipmap-anydpi-v26', exist_ok=True)
+          adaptive = '<?xml version="1.0" encoding="utf-8"?><adaptive-icon xmlns:android="http://schemas.android.com/apk/res/android"><background android:drawable="@drawable/ic_launcher_background" /><foreground android:drawable="@mipmap/ic_launcher_foreground" /></adaptive-icon>'
+          with open(f'{RES}/mipmap-anydpi-v26/ic_launcher.xml', 'w') as f:
+              f.write(adaptive)
+          with open(f'{RES}/mipmap-anydpi-v26/ic_launcher_round.xml', 'w') as f:
+              f.write(adaptive)
+
+          stale = f'{RES}/drawable/ic_launcher_foreground.xml'
+          if os.path.exists(stale):
+              os.remove(stale)
+              print(f"Removed stale {stale}")
+
+          print("All visual assets generated.")
+          PYEOF
 
       - name: Install Gradle 8.2
         uses: gradle/actions/setup-gradle@v3
