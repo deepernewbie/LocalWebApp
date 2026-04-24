@@ -8,20 +8,19 @@ android {
     compileSdk 34
 
     defaultConfig {
-        applicationId "com.couchflow"
+        // Keep the original applicationId so the new release replaces the
+        // existing installed APK (Android identifies apps by applicationId,
+        // not label). Changing it would install CouchFlow as a second,
+        // separate app alongside the old one.
+        applicationId "com.localwebapp"
         minSdk 26
         targetSdk 34
         versionCode 2
         versionName "2.0"
-        // Output APK file name base -> CouchFlow-release.apk / CouchFlow-debug.apk
+        // Output APK file name: CouchFlow-release.apk / CouchFlow-debug.apk
         archivesBaseName = "CouchFlow"
     }
 
-    // Signing config for the release build. Uses the debug keystore by
-    // default, which is generated on first build (or by CI). This lets
-    // release APKs be built and installed without managing a separate
-    // Play Store keystore. Replace with a real keystore later if you
-    // publish to the Play Store.
     signingConfigs {
         release {
             storeFile     file("${rootProject.projectDir}/app/debug.keystore")
@@ -41,8 +40,6 @@ android {
         }
         debug {
             debuggable true
-            applicationIdSuffix ".debug"
-            versionNameSuffix   "-debug"
         }
     }
 
