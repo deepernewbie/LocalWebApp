@@ -53,11 +53,7 @@ persist to real disk that the user can see in their file manager.
 
 ## Install
 
-Grab the latest APK from [Releases](../../releases) and sideload. Requires
-Android 7.0 (API 24) or newer.
-
-Builds also run on every push via GitHub Actions — check the Actions tab
-for signed debug APKs.
+Grab the latest APK from Actions — check the Actions tab for signed release APKs.
 
 ---
 
