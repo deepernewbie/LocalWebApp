@@ -56,14 +56,6 @@ persist to real disk that the user can see in their file manager.
 Grab the latest APK from [Releases](../../releases) and sideload. Requires
 Android 7.0 (API 24) or newer.
 
-Or build from source:
-```bash
-git clone https://github.com/YOU/CouchFlow.git
-cd CouchFlow
-./gradlew assembleDebug
-# APK lands in app/build/outputs/apk/debug/
-```
-
 Builds also run on every push via GitHub Actions — check the Actions tab
 for signed debug APKs.
 
