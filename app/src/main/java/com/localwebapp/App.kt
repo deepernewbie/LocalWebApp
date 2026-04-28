@@ -950,15 +950,15 @@ class WebAppActivity : AppCompatActivity() {
         // No web-app-visible API removed; everything from v3 still works.
         private const val LWA_SHIM_JS = """
 (function(){
-  if (window.__couchflow_shim_v5) return;
-  window.__couchflow_shim_v5 = true;
+  if (window.__couchflow_shim_v6) return;
+  window.__couchflow_shim_v6 = true;
 
   var features = [];
   var readyResolve;
   var readyPromise = new Promise(function(r){ readyResolve = r; });
 
   var lwaObj = {
-    version:  'v5',
+    version:  'v6',
     features: features,
     ready:    readyPromise,
     isNative: typeof Android !== 'undefined' && typeof Android.isNativeApp === 'function'
@@ -1065,6 +1065,81 @@ class WebAppActivity : AppCompatActivity() {
       if (data.files && data.files.length > 0) return !!Android.shareFiles;
       if (data.text || data.url || data.title) return !!Android.share;
       return false;
+    };
+  }
+
+  // navigator.clipboard patching: WebView's clipboard is unreliable on
+  // many Android versions and gesture-bound on all of them. Native is
+  // consistent. Falls back to original navigator.clipboard if Android
+  // bridge is missing (browser mode).
+  if (typeof navigator !== 'undefined' &&
+      typeof Android !== 'undefined' &&
+      Android.clipboardWrite && Android.clipboardRead) {
+    var origClip = navigator.clipboard;
+    navigator.clipboard = {
+      writeText: function(text) {
+        try {
+          var r = Android.clipboardWrite(String(text == null ? '' : text));
+          if (r === 'ok') return Promise.resolve();
+          throw new Error(r || 'clipboardWrite failed');
+        } catch (e) {
+          if (origClip && origClip.writeText) return origClip.writeText(text);
+          return Promise.reject(e);
+        }
+      },
+      readText: function() {
+        try {
+          return Promise.resolve(Android.clipboardRead() || '');
+        } catch (e) {
+          if (origClip && origClip.readText) return origClip.readText();
+          return Promise.reject(e);
+        }
+      },
+      // Forward through to the original for richer ClipboardItem reads/writes
+      write: origClip && origClip.write ? origClip.write.bind(origClip) :
+        function() { return Promise.reject(new DOMException('write unsupported','NotSupportedError')); },
+      read:  origClip && origClip.read  ? origClip.read.bind(origClip)  :
+        function() { return Promise.reject(new DOMException('read unsupported','NotSupportedError')); }
+    };
+  }
+
+  // CouchFlow.requestPermission(name) -> Promise<"granted"|"denied"|"blocked">.
+  // Web apps use this for the recovery flow when the user previously denied
+  // mic/camera and now wants to enable it. Wraps Android.requestPermission +
+  // polling via setTimeout because @JavascriptInterface cannot be async.
+  if (typeof Android !== 'undefined' && Android.requestPermission && Android.checkPermission) {
+    lwaObj.checkPermission = function(name) {
+      try { return Android.checkPermission(String(name)); }
+      catch (e) { return 'denied'; }
+    };
+    lwaObj.requestPermission = function(name) {
+      var n = String(name);
+      var initial;
+      try { initial = Android.checkPermission(n); } catch (e) { initial = 'denied'; }
+      if (initial === 'granted') return Promise.resolve('granted');
+      if (initial === 'blocked') return Promise.resolve('blocked');
+      try { Android.requestPermission(n); } catch (e) {
+        return Promise.reject(e);
+      }
+      // Poll the result. The system dialog is modal; we wait for it to
+      // close, then read the new state. Cap at 30s to avoid hanging
+      // forever if the user backgrounded the app and forgot.
+      return new Promise(function(resolve) {
+        var elapsed = 0;
+        var step = 250;
+        var tick = function() {
+          elapsed += step;
+          var cur;
+          try { cur = Android.checkPermission(n); } catch (e) { cur = 'denied'; }
+          if (cur === 'granted' || cur === 'blocked') return resolve(cur);
+          if (elapsed >= 30000) return resolve(cur);  // timeout: 'denied'
+          setTimeout(tick, step);
+        };
+        setTimeout(tick, step);
+      });
+    };
+    lwaObj.openAppSettings = function() {
+      try { Android.openAppSettings(); return true; } catch (e) { return false; }
     };
   }
 
@@ -1360,6 +1435,12 @@ class WebAppActivity : AppCompatActivity() {
     };
 
     var origFetch = window.fetch ? window.fetch.bind(window) : null;
+    // Threshold above which the shim skips the AndroidFS round-trip and
+    // lets the request go to the localhost server, which now handles PUT
+    // natively by streaming the body to disk. Below the threshold we keep
+    // the bridge path because it's slightly faster for small bodies.
+    var BRIDGE_PUT_LIMIT = 2 * 1024 * 1024;  // 2 MB
+
     window.fetch = function(input, init) {
       var url = (typeof input === 'string') ? input : (input && input.url);
       var method = (init && init.method ? init.method : 'GET').toUpperCase();
@@ -1369,6 +1450,21 @@ class WebAppActivity : AppCompatActivity() {
           var path = decodeURIComponent(u.pathname.replace(/^\//, ''));
           if (method === 'PUT' || method === 'POST') {
             var body = init && init.body;
+            // Estimate body size cheaply. For Blobs and ArrayBuffers we know
+            // exactly. For strings we use length (approximate but adequate).
+            var bigBody = false;
+            if (body instanceof Blob && body.size > BRIDGE_PUT_LIMIT) bigBody = true;
+            else if (body instanceof ArrayBuffer && body.byteLength > BRIDGE_PUT_LIMIT) bigBody = true;
+            else if (typeof body === 'string' && body.length > BRIDGE_PUT_LIMIT) bigBody = true;
+
+            if (bigBody) {
+              // Let the request fall through to the original fetch -> the
+              // localhost server's streaming PUT handler. Saves a base64
+              // round-trip and keeps memory bounded for large recordings.
+              return origFetch ? origFetch(input, init)
+                               : Promise.reject(new Error('fetch unavailable'));
+            }
+
             return new Promise(function(resolve){
               var done = function(ok) {
                 resolve(new Response(ok ? 'ok' : 'fail', {
@@ -1406,15 +1502,19 @@ class WebAppActivity : AppCompatActivity() {
 
   if (typeof Android !== 'undefined') {
     features.push('share', 'vibrate', 'toast', 'debug');
-    if (Android.shareFiles) features.push('share-files');
+    if (Android.shareFiles)       features.push('share-files');
+    if (Android.clipboardWrite)   features.push('clipboard');
+    if (Android.requestPermission) features.push('permissions');
+    if (Android.openExternalUrl)  features.push('external-url');
+    if (Android.clearModelCache)  features.push('cache-control');
   }
 
   readyResolve({
     features: features.slice(),
-    version:  'v5',
+    version:  'v6',
     isNative: lwaObj.isNative
   });
-  console.log('[CouchFlow] shim v5 ready - features:', features.join(','));
+  console.log('[CouchFlow] shim v6 ready - features:', features.join(','));
 })();
 """
     }
@@ -1772,6 +1872,145 @@ class WebAppActivity : AppCompatActivity() {
                     v.vibrate(android.os.VibrationEffect.createOneShot(100, android.os.VibrationEffect.DEFAULT_AMPLITUDE))
                 else @Suppress("DEPRECATION") v.vibrate(100)
             }
+
+            /**
+             * Read clipboard text. WebView's clipboard API is unreliable on
+             * many Android versions and gesture-bound on all of them. Native
+             * is consistent.
+             */
+            @JavascriptInterface fun clipboardRead(): String {
+                return try {
+                    val cm = getSystemService(Context.CLIPBOARD_SERVICE) as android.content.ClipboardManager
+                    val text = cm.primaryClip?.getItemAt(0)?.coerceToText(this@WebAppActivity)?.toString() ?: ""
+                    DebugLog.bridge("Android.clipboardRead", "", "${text.length}ch")
+                    text
+                } catch (e: Exception) {
+                    DebugLog.bridge("Android.clipboardRead", "", "error:${e.message}")
+                    ""
+                }
+            }
+
+            /** Write clipboard text. */
+            @JavascriptInterface fun clipboardWrite(text: String): String {
+                return try {
+                    runOnUiThread {
+                        val cm = getSystemService(Context.CLIPBOARD_SERVICE) as android.content.ClipboardManager
+                        cm.setPrimaryClip(android.content.ClipData.newPlainText("CouchFlow", text))
+                    }
+                    DebugLog.bridge("Android.clipboardWrite", "${text.length}ch", "ok")
+                    "ok"
+                } catch (e: Exception) {
+                    DebugLog.bridge("Android.clipboardWrite", "${text.length}ch", "error:${e.message}")
+                    "error:${e.message}"
+                }
+            }
+
+            /**
+             * Open an external URL in the system browser/app. Distinct from
+             * navigating the WebView itself. Used by web apps that want a
+             * "View on GitHub" / "Open documentation" button that doesn't
+             * leave the web app.
+             */
+            @JavascriptInterface fun openExternalUrl(url: String): String {
+                return try {
+                    runOnUiThread {
+                        val intent = Intent(Intent.ACTION_VIEW, Uri.parse(url)).apply {
+                            addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                        }
+                        startActivity(intent)
+                    }
+                    DebugLog.bridge("Android.openExternalUrl", "\"${truncate(url, 80)}\"", "ok")
+                    "ok"
+                } catch (e: Exception) {
+                    DebugLog.bridge("Android.openExternalUrl", "\"${truncate(url, 80)}\"", "error:${e.message}")
+                    "error:${e.message}"
+                }
+            }
+
+            /**
+             * Check the current grant state of a runtime permission.
+             * Returns "granted", "denied", or "blocked" (denied with
+             * "don't ask again"). For "blocked", only the system Settings
+             * page can re-grant — the bridge cannot prompt again.
+             *
+             * Accepted names: "microphone", "camera", "location".
+             */
+            @JavascriptInterface fun checkPermission(name: String): String {
+                val perm = mapPermissionName(name) ?: return "error:unknown permission"
+                val granted = checkSelfPermission(perm) ==
+                    android.content.pm.PackageManager.PERMISSION_GRANTED
+                if (granted) return "granted"
+                // shouldShowRequestPermissionRationale returns false in two cases:
+                // (a) the user has never been asked, OR
+                // (b) the user denied with "don't ask again". We treat (b) as
+                // "blocked" and (a) as "denied" — indistinguishable from API
+                // alone, so we rely on a SharedPreferences flag set when the
+                // user first sees the prompt.
+                val asked = getSharedPreferences("CouchFlow", MODE_PRIVATE)
+                    .getBoolean("perm_asked_$name", false)
+                val rationale = shouldShowRequestPermissionRationale(perm)
+                return when {
+                    !asked     -> "denied"   // never asked yet
+                    rationale  -> "denied"   // can ask again
+                    else       -> "blocked"  // "don't ask again" was selected
+                }
+            }
+
+            /**
+             * Re-request a permission. Returns "granted", "denied", or
+             * "blocked" via the standard runtime callback. If "blocked",
+             * the web app should call openAppSettings() to send the user
+             * to the system settings page.
+             *
+             * This is synchronous from the JS side because @JavascriptInterface
+             * methods can't be async — the shim wraps it in setTimeout polling.
+             */
+            @JavascriptInterface fun requestPermission(name: String): String {
+                val perm = mapPermissionName(name) ?: return "error:unknown permission"
+                if (checkSelfPermission(perm) == android.content.pm.PackageManager.PERMISSION_GRANTED) {
+                    return "granted"
+                }
+                getSharedPreferences("CouchFlow", MODE_PRIVATE).edit()
+                    .putBoolean("perm_asked_$name", true).apply()
+                runOnUiThread {
+                    runtimePermsLauncher.launch(arrayOf(perm))
+                }
+                // Return immediately; the web app polls checkPermission()
+                // to discover the outcome after the system dialog closes.
+                DebugLog.bridge("Android.requestPermission", "\"$name\"", "prompted")
+                return "prompted"
+            }
+
+            /** Open this app's system settings page so the user can manually
+             *  grant a previously-blocked permission. */
+            @JavascriptInterface fun openAppSettings(): String {
+                return try {
+                    runOnUiThread {
+                        val intent = Intent(android.provider.Settings.ACTION_APPLICATION_DETAILS_SETTINGS).apply {
+                            data = Uri.fromParts("package", packageName, null)
+                            addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                        }
+                        startActivity(intent)
+                    }
+                    DebugLog.bridge("Android.openAppSettings", "", "ok")
+                    "ok"
+                } catch (e: Exception) {
+                    "error:${e.message}"
+                }
+            }
+
+            /** Clear CouchFlow's transparent network cache (model files
+             *  downloaded from huggingface.co etc). Used for recovering from
+             *  a corrupt cache. The debug overlay also exposes this. */
+            @JavascriptInterface fun clearModelCache(): String {
+                return try {
+                    val n = clearNetCache(netCacheDir)
+                    DebugLog.lifecycle("model cache cleared: $n files removed")
+                    "ok:$n"
+                } catch (e: Exception) {
+                    "error:${e.message}"
+                }
+            }
             @JavascriptInterface fun getFreeMB(): String {
                 val mb = try {
                     val stat = android.os.StatFs(filesDir.path)
@@ -1857,9 +2096,21 @@ class WebAppActivity : AppCompatActivity() {
                 if (method != "GET")   return null
                 if (!shouldCache(url)) return null
                 val cacheFile = urlToCacheFile(url)
+                // Sidecar size file written alongside successful cache entries
+                // so corrupt/partial caches can be detected on next access.
+                // Format: just the byte count as ASCII.
+                val sizeFile = File(cacheFile.parent, "${cacheFile.name}.size")
                 if (cacheFile.exists() && cacheFile.length() > 0) {
-                    DebugLog.fetch("CACHE", url, 200, 0)
-                    return streamFromDisk(cacheFile, url)
+                    val expected = sizeFile.takeIf { it.exists() }?.readText()?.trim()?.toLongOrNull()
+                    if (expected == null || expected == cacheFile.length()) {
+                        DebugLog.fetch("CACHE", url, 200, 0)
+                        return streamFromDisk(cacheFile, url)
+                    }
+                    // Size mismatch: cache is corrupt. Drop it and re-download.
+                    DebugLog.error("cache size mismatch on $url: " +
+                        "expected=$expected actual=${cacheFile.length()}, will redownload")
+                    cacheFile.delete()
+                    sizeFile.delete()
                 }
                 val started = System.currentTimeMillis()
                 return try {
@@ -1874,17 +2125,34 @@ class WebAppActivity : AppCompatActivity() {
                     if (contentType.contains("text/html")) {
                         conn.disconnect(); return null
                     }
+                    val expectedLen: Long = try { conn.contentLengthLong } catch (_: Exception) { -1L }
                     cacheFile.parentFile?.mkdirs()
                     val tmpFile = File(cacheFile.parent, "${cacheFile.name}.tmp")
                     tmpFile.delete()
                     val buf = ByteArray(512 * 1024)
+                    var written = 0L
                     try {
                         FileOutputStream(tmpFile).use { fos ->
                             val net = conn.inputStream
                             var n: Int
-                            while (net.read(buf).also { n = it } != -1) fos.write(buf, 0, n)
+                            while (net.read(buf).also { n = it } != -1) {
+                                fos.write(buf, 0, n)
+                                written += n
+                            }
+                        }
+                        // Validate completeness when Content-Length was advertised.
+                        // If the server closed early, written < expectedLen and we
+                        // do NOT promote tmp -> final; user retries get fresh download.
+                        if (expectedLen >= 0 && written != expectedLen) {
+                            tmpFile.delete()
+                            DebugLog.error("incomplete download for $url: " +
+                                "got=$written expected=$expectedLen, not caching")
+                            DebugLog.fetch("GET", url, -1, System.currentTimeMillis() - started)
+                            return null
                         }
                         tmpFile.renameTo(cacheFile)
+                        // Write size sidecar so next-launch sanity check works.
+                        sizeFile.writeText(written.toString())
                     } catch (e: Exception) {
                         tmpFile.delete(); conn.disconnect()
                         DebugLog.fetch("GET", url, -1, System.currentTimeMillis() - started)
@@ -2035,6 +2303,26 @@ class WebAppActivity : AppCompatActivity() {
     private fun truncate(s: String, max: Int): String =
         if (s.length <= max) s else "${s.take(max - 1)}…"
 
+    private fun mapPermissionName(name: String): String? = when (name.lowercase()) {
+        "microphone", "mic", "audio"   -> android.Manifest.permission.RECORD_AUDIO
+        "camera"                        -> android.Manifest.permission.CAMERA
+        "location", "geolocation"       -> android.Manifest.permission.ACCESS_FINE_LOCATION
+        else -> null
+    }
+
+    /** Recursively delete contents of the network cache dir, return file count. */
+    private fun clearNetCache(dir: File): Int {
+        if (!dir.exists()) return 0
+        var count = 0
+        fun rm(f: File) {
+            if (f.isDirectory) f.listFiles()?.forEach { rm(it) }
+            if (f.delete()) count++
+        }
+        dir.listFiles()?.forEach { rm(it) }
+        dir.mkdirs()
+        return count
+    }
+
     private fun streamFromDisk(file: File, url: String): WebResourceResponse {
         return WebResourceResponse(
             guessMime(url), null, 200, "OK",
@@ -2127,8 +2415,9 @@ class WebAppActivity : AppCompatActivity() {
 
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// SimpleServer — HTTP server with stable port, HTML shim injection, and Range
-// support so <audio> / <video> elements can scrub through media files.
+// SimpleServer — HTTP server with stable port, HTML shim injection, Range
+// support so <audio> / <video> elements can scrub through media files,
+// and PUT/DELETE so large writes stream straight to disk via SAF.
 // ═══════════════════════════════════════════════════════════════════════════════
 class SimpleServer(
     private val resolver: ContentResolver,
@@ -2191,7 +2480,8 @@ class SimpleServer(
         val method: String,
         val path: String,
         val rangeStart: Long?,
-        val rangeEnd: Long?
+        val rangeEnd: Long?,
+        val contentLength: Long
     )
 
     private fun parseRequest(reader: java.io.BufferedReader): ParsedRequest? {
@@ -2202,11 +2492,15 @@ class SimpleServer(
         val path = URLDecoder.decode(parts[1].substringBefore("?"), "UTF-8")
 
         var rangeHeader: String? = null
+        var contentLength = 0L
         do {
             val h = reader.readLine() ?: break
             if (h.isBlank()) break
             if (h.startsWith("Range:", ignoreCase = true)) {
                 rangeHeader = h.substringAfter(":").trim()
+            }
+            if (h.startsWith("Content-Length:", ignoreCase = true)) {
+                contentLength = h.substringAfter(":").trim().toLongOrNull() ?: 0L
             }
         } while (true)
 
@@ -2214,8 +2508,6 @@ class SimpleServer(
         var end: Long? = null
         if (rangeHeader != null && rangeHeader.startsWith("bytes=")) {
             val spec = rangeHeader.removePrefix("bytes=").trim()
-            // Only handle the single "start-end" or "start-" form (most common
-            // case from <audio>/<video> scrubbing). Multi-range is rare.
             val dash = spec.indexOf('-')
             if (dash > 0) {
                 start = spec.substring(0, dash).toLongOrNull()
@@ -2224,14 +2516,31 @@ class SimpleServer(
                 // suffix form "-N" — last N bytes; skip
             }
         }
-        return ParsedRequest(method, path, start, end)
+        return ParsedRequest(method, path, start, end, contentLength)
     }
 
     private fun handle(s: java.net.Socket) {
-        val reader = s.inputStream.bufferedReader(Charsets.ISO_8859_1)
+        // We need the raw InputStream for body reading on PUT, but BufferedReader
+        // for header parsing. They share the underlying stream so we read headers
+        // first, then any remaining bytes are the body.
+        val rawIn  = s.inputStream
+        val reader = rawIn.bufferedReader(Charsets.ISO_8859_1)
         val out    = s.outputStream
         val req = parseRequest(reader) ?: return
 
+        // PUT / DELETE / POST are write operations on the picked folder.
+        // Dispatched here instead of going through the shim's AndroidFS path,
+        // so large bodies stream straight to disk without a base64 round-trip.
+        if (req.method == "PUT" || req.method == "POST") {
+            handleWrite(rawIn, out, req)
+            return
+        }
+        if (req.method == "DELETE") {
+            handleDelete(out, req)
+            return
+        }
+
+        // GET / HEAD: serve from the picked folder
         var path = req.path
         if (path == "/" || path.isEmpty()) path = "/index.html"
         val segments = path.trimStart('/').split("/").filter { it.isNotEmpty() && it != ".." }
@@ -2248,6 +2557,96 @@ class SimpleServer(
             }
             else -> serveDocFile(out, file, req)
         }
+    }
+
+    /**
+     * Write the request body to a file under the picked folder, streaming
+     * bytes directly from the network socket to the SAF output stream.
+     * No buffering of the full body in memory.
+     */
+    private fun handleWrite(rawIn: java.io.InputStream, out: OutputStream, req: ParsedRequest) {
+        val path = req.path.trimStart('/')
+        if (path.isEmpty() || path.contains("..")) {
+            sendStatus(out, 400, "Bad path"); return
+        }
+        val segments = path.split("/").filter { it.isNotEmpty() }
+        if (segments.isEmpty()) { sendStatus(out, 400, "Bad path"); return }
+
+        val ctx = try {
+            val f = ContentResolver::class.java.getDeclaredField("mContext")
+            f.isAccessible = true
+            f.get(resolver) as Context
+        } catch (e: Exception) {
+            sendStatus(out, 500, "Resolver unavailable"); return
+        }
+        val root = DocumentFile.fromTreeUri(ctx, rootUri)
+        if (root == null) { sendStatus(out, 500, "Root unavailable"); return }
+
+        // Walk/create directories
+        var node: DocumentFile = root
+        for (i in 0 until segments.size - 1) {
+            val name = segments[i]
+            val child = node.findFile(name)
+            node = if (child != null && child.isDirectory) child
+                   else node.createDirectory(name) ?: run {
+                       sendStatus(out, 500, "mkdir failed: $name"); return
+                   }
+        }
+        val leaf = segments.last()
+        val target = node.findFile(leaf) ?: node.createFile("application/octet-stream", leaf)
+        if (target == null) { sendStatus(out, 500, "Could not create file"); return }
+
+        // Stream the body from socket -> SAF output
+        try {
+            val outputStream = resolver.openOutputStream(target.uri, "wt")
+                ?: run { sendStatus(out, 500, "openOutputStream failed"); return }
+            outputStream.use { os ->
+                val buf = ByteArray(64 * 1024)
+                var remaining = req.contentLength
+                if (remaining <= 0) {
+                    // No Content-Length -> read until EOF (rare for PUT, but
+                    // some clients use chunked encoding which we don't unchunk;
+                    // accept here and pray).
+                    var n: Int
+                    while (rawIn.read(buf).also { n = it } != -1) os.write(buf, 0, n)
+                } else {
+                    while (remaining > 0) {
+                        val toRead = minOf(buf.size.toLong(), remaining).toInt()
+                        val n = rawIn.read(buf, 0, toRead)
+                        if (n < 0) break
+                        os.write(buf, 0, n)
+                        remaining -= n
+                    }
+                }
+            }
+            sendStatus(out, 200, "OK")
+        } catch (e: Exception) {
+            sendStatus(out, 500, "Write failed: ${e.message}")
+        }
+    }
+
+    private fun handleDelete(out: OutputStream, req: ParsedRequest) {
+        val path = req.path.trimStart('/')
+        if (path.isEmpty() || path.contains("..")) {
+            sendStatus(out, 400, "Bad path"); return
+        }
+        val segments = path.split("/").filter { it.isNotEmpty() }
+        val target = resolve(segments)
+        if (target == null || !target.exists()) {
+            sendStatus(out, 404, "Not found"); return
+        }
+        if (target.delete()) sendStatus(out, 200, "OK")
+        else                 sendStatus(out, 500, "Delete failed")
+    }
+
+    private fun sendStatus(out: OutputStream, code: Int, reason: String) {
+        val body = reason.toByteArray()
+        val header = "HTTP/1.1 $code $reason\r\n" +
+            "Content-Type: text/plain\r\n" +
+            "Content-Length: ${body.size}\r\n" +
+            "Access-Control-Allow-Origin: *\r\n\r\n"
+        out.write(header.toByteArray(Charsets.ISO_8859_1))
+        out.write(body); out.flush()
     }
 
     private fun resolve(segments: List<String>): DocumentFile? {
@@ -2517,6 +2916,26 @@ class DebugOverlayActivity : AppCompatActivity() {
             DebugLog.clear()
             refreshList()
         }
+        // Long-press btnClear = clear log AND clear model cache. Used to
+        // recover from corrupt/partial model downloads (e.g. tokenizer.json
+        // half-written, transformers.js fails to parse on every load).
+        btnClear.setOnLongClickListener {
+            AlertDialog.Builder(this)
+                .setTitle("Clear model cache?")
+                .setMessage("This deletes all cached model files (HuggingFace, JSDelivr, etc). " +
+                        "They'll be re-downloaded next time. Use this if a web app fails " +
+                        "to load with a 'JSON parse' or 'corrupt model' error.")
+                .setPositiveButton("Clear cache") { _, _ ->
+                    val cacheDir = File(filesDir, "netcache")
+                    val n = clearCacheDir(cacheDir)
+                    DebugLog.clear()
+                    refreshList()
+                    Toast.makeText(this, "Cleared $n cached files", Toast.LENGTH_SHORT).show()
+                }
+                .setNegativeButton("Cancel", null)
+                .show()
+            true
+        }
         btnCopy.setOnClickListener {
             val text = DebugLog.renderForAi()
             copyToClipboard(text)
@@ -2531,8 +2950,61 @@ class DebugOverlayActivity : AppCompatActivity() {
                 putExtra(Intent.EXTRA_SUBJECT, "CouchFlow debug log")
             }, "Share debug log"))
         }
+        // Long-press btnShare = formatted bug-report flow. Pre-fills a
+        // template that asks the user what they were doing when the issue
+        // occurred and includes the log. Lower friction than copy+paste
+        // when the user wants to ship the log to their AI assistant.
+        btnShare.setOnLongClickListener {
+            val log = DebugLog.renderForAi()
+            val template = buildString {
+                appendLine("Hi — my CouchFlow web app misbehaved. Below is the debug log " +
+                        "captured during the session.")
+                appendLine()
+                appendLine("What I was trying to do:")
+                appendLine("(describe here)")
+                appendLine()
+                appendLine("What I expected:")
+                appendLine("(describe here)")
+                appendLine()
+                appendLine("What happened:")
+                appendLine("(describe here)")
+                appendLine()
+                appendLine("---- DEBUG LOG ----")
+                append(log)
+            }
+            copyToClipboard(template)
+            startActivity(Intent.createChooser(Intent(Intent.ACTION_SEND).apply {
+                type = "text/plain"
+                putExtra(Intent.EXTRA_TEXT, template)
+                putExtra(Intent.EXTRA_SUBJECT, "CouchFlow bug report")
+            }, "Send bug report"))
+            true
+        }
         btnSave.setOnClickListener { saveLogToDownloads() }
         btnClose.setOnClickListener { finish() }
+
+        // Hint about the long-press shortcuts. Shown once per app install.
+        val prefs = getSharedPreferences("CouchFlow", MODE_PRIVATE)
+        if (!prefs.getBoolean("debug_longpress_hinted", false)) {
+            Toast.makeText(this,
+                "Tip: long-press Clear to also clear model cache. " +
+                "Long-press Share to format as a bug report.",
+                Toast.LENGTH_LONG).show()
+            prefs.edit().putBoolean("debug_longpress_hinted", true).apply()
+        }
+    }
+
+    /** Recursively delete contents of a directory, return file count. */
+    private fun clearCacheDir(dir: File): Int {
+        if (!dir.exists()) return 0
+        var count = 0
+        fun rm(f: File) {
+            if (f.isDirectory) f.listFiles()?.forEach { rm(it) }
+            if (f.delete()) count++
+        }
+        dir.listFiles()?.forEach { rm(it) }
+        dir.mkdirs()
+        return count
     }
 
     override fun onResume() { super.onResume(); refreshList() }
