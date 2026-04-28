@@ -950,23 +950,20 @@ class WebAppActivity : AppCompatActivity() {
         // No web-app-visible API removed; everything from v3 still works.
         private const val LWA_SHIM_JS = """
 (function(){
-  if (window.__couchflow_shim_v4) return;
-  window.__couchflow_shim_v4 = true;
+  if (window.__couchflow_shim_v5) return;
+  window.__couchflow_shim_v5 = true;
 
   var features = [];
   var readyResolve;
   var readyPromise = new Promise(function(r){ readyResolve = r; });
 
   var lwaObj = {
-    version:  'v4',
+    version:  'v5',
     features: features,
     ready:    readyPromise,
     isNative: typeof Android !== 'undefined' && typeof Android.isNativeApp === 'function'
   };
 
-  // Optional debug-event API. Web apps that don't call this still get full
-  // automatic capture. Apps that do call it get richer logs to share with
-  // their AI assistant when something goes wrong.
   function debugPush(label, payload) {
     try {
       if (typeof Android !== 'undefined' && Android.debugUserEvent) {
@@ -979,11 +976,21 @@ class WebAppActivity : AppCompatActivity() {
   }
   lwaObj.debug = debugPush;
 
+  // Convenience wrapper so web apps can wire their own "View log" button to
+  // CouchFlow.openDebugLog() without name-checking Android.openDebugLog.
+  lwaObj.openDebugLog = function() {
+    try {
+      if (typeof Android !== 'undefined' && Android.openDebugLog) {
+        Android.openDebugLog();
+        return true;
+      }
+    } catch(e) {}
+    return false;
+  };
+
   window.LWA = lwaObj;
   window.CouchFlow = lwaObj;
 
-  // Surface uncaught errors and rejections to the native log so the user can
-  // share them with their AI without needing devtools.
   window.addEventListener('error', function(ev) {
     try {
       var msg = (ev.message || 'error') +
@@ -1000,6 +1007,66 @@ class WebAppActivity : AppCompatActivity() {
       if (typeof Android !== 'undefined' && Android.debugError) Android.debugError(msg);
     } catch(_) {}
   });
+
+  // navigator.share patching: Web Share API Level 2 supports {files: File[]}.
+  // Route file shares through Android.shareFiles so web apps use the standard
+  // Web API and never need to know about CouchFlow.
+  if (typeof navigator !== 'undefined' && typeof Android !== 'undefined') {
+    var origShare = navigator.share ? navigator.share.bind(navigator) : null;
+
+    function blobToBase64(blob) {
+      return new Promise(function(resolve, reject) {
+        var fr = new FileReader();
+        fr.onload = function() {
+          var s = fr.result || '';
+          var comma = s.indexOf(',');
+          resolve(comma >= 0 ? s.slice(comma + 1) : s);
+        };
+        fr.onerror = function() { reject(fr.error || new Error('FileReader failed')); };
+        fr.readAsDataURL(blob);
+      });
+    }
+
+    navigator.share = function(data) {
+      data = data || {};
+      if (data.files && data.files.length > 0 && Android.shareFiles) {
+        var promises = [];
+        for (var i = 0; i < data.files.length; i++) {
+          (function(f, idx) {
+            promises.push(blobToBase64(f).then(function(b64) {
+              return {
+                name:     f.name || ('file-' + idx),
+                mimeType: f.type || 'application/octet-stream',
+                base64:   b64
+              };
+            }));
+          })(data.files[i], i);
+        }
+        return Promise.all(promises).then(function(payload) {
+          var json = JSON.stringify(payload);
+          var r = Android.shareFiles(json);
+          if (r === 'ok') return undefined;
+          throw new Error(r || 'shareFiles failed');
+        });
+      }
+      if ((data.text || data.url) && Android.share) {
+        var t = (data.title ? data.title + '\n' : '') +
+                (data.text  ? data.text  : '') +
+                (data.url   ? (data.text ? '\n' : '') + data.url : '');
+        Android.share(t);
+        return Promise.resolve();
+      }
+      if (origShare) return origShare(data);
+      return Promise.reject(new DOMException('share unsupported', 'NotSupportedError'));
+    };
+
+    navigator.canShare = function(data) {
+      if (!data) return true;
+      if (data.files && data.files.length > 0) return !!Android.shareFiles;
+      if (data.text || data.url || data.title) return !!Android.share;
+      return false;
+    };
+  }
 
   if (typeof Android !== 'undefined' && typeof Android.recStart === 'function') {
     features.push('audio');
@@ -1339,14 +1406,15 @@ class WebAppActivity : AppCompatActivity() {
 
   if (typeof Android !== 'undefined') {
     features.push('share', 'vibrate', 'toast', 'debug');
+    if (Android.shareFiles) features.push('share-files');
   }
 
   readyResolve({
     features: features.slice(),
-    version:  'v4',
+    version:  'v5',
     isNative: lwaObj.isNative
   });
-  console.log('[CouchFlow] shim v4 ready - features:', features.join(','));
+  console.log('[CouchFlow] shim v5 ready - features:', features.join(','));
 })();
 """
     }
@@ -1611,6 +1679,92 @@ class WebAppActivity : AppCompatActivity() {
                         type = "text/plain"; putExtra(Intent.EXTRA_TEXT, text)
                     }, "Share"))
             }
+
+            /**
+             * Open the in-app debug log overlay. Web apps that want to expose
+             * their own "Show debug log" button (e.g. in a settings panel)
+             * call this so users don't need to know the persistent-button
+             * toggle gesture.
+             */
+            @JavascriptInterface fun openDebugLog(): Unit = runOnUiThread {
+                DebugLog.bridge("Android.openDebugLog", "", "ok")
+                openDebugOverlay()
+            }
+
+            /**
+             * Share files from the web app via the system share sheet.
+             *
+             * Receives a JSON-stringified array of {name, mimeType, base64}.
+             * Writes each entry to a temp file under cacheDir/share-tmp/,
+             * then fires ACTION_SEND_MULTIPLE with FileProvider content URIs.
+             *
+             * The shim patches navigator.share() to call this when the web
+             * app passes {files: [Blob]}, so most web apps will use the
+             * standard Web Share API and never see this method directly.
+             *
+             * Cap: each base64 payload is ~10MB max (about 7.5MB binary).
+             * Larger payloads should be split or written to disk first.
+             */
+            @JavascriptInterface fun shareFiles(payloadJson: String): String {
+                return try {
+                    val arr = org.json.JSONArray(payloadJson)
+                    if (arr.length() == 0) return "error:no files"
+
+                    val tmpDir = File(cacheDir, "share-tmp").also { d ->
+                        d.mkdirs()
+                        d.listFiles()?.forEach { it.delete() }
+                    }
+                    val uris = ArrayList<Uri>()
+                    var sharedMime: String? = null
+                    for (i in 0 until arr.length()) {
+                        val o = arr.getJSONObject(i)
+                        val name = (o.optString("name").ifEmpty { "file-$i" })
+                            .replace(Regex("[^a-zA-Z0-9._-]"), "_")
+                            .take(80)
+                        val mimeType = o.optString("mimeType")
+                            .ifEmpty { "application/octet-stream" }
+                        val b64 = o.optString("base64")
+                        if (b64.isEmpty()) continue
+                        val bytes = Base64.decode(b64, Base64.DEFAULT)
+                        val outFile = File(tmpDir, "${System.currentTimeMillis()}-$i-$name")
+                        outFile.outputStream().use { it.write(bytes) }
+                        val uri = androidx.core.content.FileProvider.getUriForFile(
+                            this@WebAppActivity,
+                            "${packageName}.fileprovider",
+                            outFile
+                        )
+                        uris.add(uri)
+                        if (sharedMime == null) sharedMime = mimeType
+                        else if (sharedMime != mimeType) sharedMime = "*/*"
+                    }
+
+                    if (uris.isEmpty()) return "error:no valid files"
+
+                    runOnUiThread {
+                        val intent = if (uris.size == 1) {
+                            Intent(Intent.ACTION_SEND).apply {
+                                type = sharedMime ?: "*/*"
+                                putExtra(Intent.EXTRA_STREAM, uris[0])
+                                addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                            }
+                        } else {
+                            Intent(Intent.ACTION_SEND_MULTIPLE).apply {
+                                type = sharedMime ?: "*/*"
+                                putParcelableArrayListExtra(Intent.EXTRA_STREAM, uris)
+                                addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                            }
+                        }
+                        startActivity(Intent.createChooser(intent, "Share"))
+                    }
+                    DebugLog.bridge("Android.shareFiles",
+                        "${uris.size} file(s)", "intent")
+                    "ok"
+                } catch (e: Exception) {
+                    DebugLog.bridge("Android.shareFiles", "json", "error:${e.message}")
+                    "error:${e.message}"
+                }
+            }
+
             @JavascriptInterface fun vibrate(): Unit = runOnUiThread {
                 DebugLog.bridge("Android.vibrate", "", "ok")
                 val v = getSystemService(Context.VIBRATOR_SERVICE) as android.os.Vibrator
@@ -1742,6 +1896,20 @@ class WebAppActivity : AppCompatActivity() {
                     DebugLog.fetch("GET", url, -1, System.currentTimeMillis() - started)
                     null
                 }
+            }
+
+            override fun onRenderProcessGone(view: WebView, detail: RenderProcessGoneDetail): Boolean {
+                val didCrash = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O)
+                    detail.didCrash() else true
+                val msg = if (didCrash) "WebView render process crashed (OOM or fatal)"
+                          else            "WebView render process killed by system"
+                DebugLog.error(msg)
+                runOnUiThread {
+                    progressBar.visibility = View.GONE
+                    errorView.visibility   = View.VISIBLE
+                    errorText.text         = "$msg.\n\nOpen the debug log for details."
+                }
+                return true
             }
         }
 
