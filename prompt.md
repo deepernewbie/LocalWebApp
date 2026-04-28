@@ -131,10 +131,51 @@ if (typeof Android !== 'undefined' && Android.toast) Android.toast('Hi');
 | `Android.getFreeMB()`             | string      | Free storage on CouchFlow's data dir in MB       |
 | `Android.setBarColor(cssColor)`   | void        | Tint status/nav bars to match web-app theme      |
 | `Android.openDebugLog()`          | void        | Open the debug log overlay programmatically      |
+| `Android.openExternalUrl(url)`    | string      | Open a URL in the system browser/app             |
 
 `Android.share(text)` is **text-only**. To share files, use the standard
 Web Share API (see below) — CouchFlow's shim routes file shares through
 native intents automatically.
+
+For permissions, clipboard, and external links, prefer the standard
+Web APIs — they're patched to use CouchFlow's native bridges where useful:
+
+* `navigator.clipboard.writeText(s)` / `readText()` route through native
+  on Android; works without user-gesture restrictions
+* `navigator.share({files:[…]})` opens the system share sheet with files
+* For "open in external browser" use `Android.openExternalUrl(url)` —
+  there's no perfect web-standard equivalent, and bare anchor clicks to
+  external URLs already navigate away from your app
+
+---
+
+## Permissions — re-prompting after denial
+
+CouchFlow asks for microphone and camera at startup. If the user denies
+them, the standard `navigator.mediaDevices.getUserMedia()` will throw
+`NotAllowedError` on subsequent calls. To recover, web apps can re-prompt:
+
+```js
+async function ensureMicAccess() {
+  if (!window.CouchFlow?.requestPermission) {
+    // Browser-mode fallback: just try getUserMedia and let the browser handle
+    return (await navigator.permissions?.query?.({name:'microphone'}))?.state || 'unknown';
+  }
+  const state = await window.CouchFlow.requestPermission('microphone');
+  if (state === 'blocked') {
+    // User picked "don't ask again". Only Settings can re-grant.
+    showRecoveryUI({
+      message: 'Microphone is blocked. Open Settings to enable it.',
+      onAction: () => window.CouchFlow.openAppSettings()
+    });
+  }
+  return state;
+}
+```
+
+Permission names accepted: `'microphone'`, `'camera'`, `'location'`.
+States returned: `'granted'`, `'denied'` (can ask again), `'blocked'`
+(only Settings can re-grant).
 
 ---
 
@@ -311,9 +352,44 @@ CouchFlow automatically caches downloads from common model hosts:
 First request downloads to disk; subsequent requests hit the cache
 instantly. The cache lives in CouchFlow's app-private data directory,
 not the user's picked folder. Use `Android.getFreeMB()` to monitor space
-when downloading several GB of models, and consider exposing a "clear
-model cache" button — the user can clear from CouchFlow's settings or
-through Android's app info screen.
+when downloading several GB of models.
+
+**Cache integrity**: every cached file is sized-validated against the
+server's Content-Length on download AND on every subsequent read.
+If a download is interrupted, the partial file is dropped instead of
+being promoted to the cache. If a previously-cached file ever shows a
+size mismatch (corruption from device-level disk issues, etc), the
+file is dropped and re-downloaded automatically.
+
+**Recovery**: if a web app fails to load a model with a "JSON parse"
+or "corrupt model" error, the user can clear the cache from the debug
+overlay (long-press the **Clear** button → confirm). All cached files
+are deleted; the next request re-downloads them. Web apps that trigger
+multi-gigabyte downloads should expose their own cache-clear button
+that calls `window.CouchFlow.clearModelCache?.()` — that's a thin
+wrapper around `Android.clearModelCache()`.
+
+---
+
+## Writing large files
+
+Standard `fetch('./big.wav', {method:'PUT', body: blob})` works for any
+size. CouchFlow's localhost server accepts PUT/POST/DELETE and streams
+the body straight to disk via SAF — no full-body buffering, no base64
+round-trips. A multi-megabyte recording uses bounded memory throughout.
+
+```js
+// Save a 50MB recording — fine
+await fetch('./recordings/long-meeting.wav', {
+  method: 'PUT',
+  body:   wavBlob          // can be any size
+});
+```
+
+For small writes (<2 MB), CouchFlow's shim takes a fast path through
+the AndroidFS bridge directly. Above 2 MB, the request hits the localhost
+server and streams. Both produce the same file in the user's picked
+folder; web apps don't need to choose.
 
 ---
 
@@ -570,8 +646,11 @@ Example:
 
 ---
 
-*Last updated for CouchFlow shim v5: in-app debug log overlay,
+*Last updated for CouchFlow shim v6: streaming PUT for large files,
+`navigator.clipboard` patching, dynamic permission re-request,
+`Android.openExternalUrl()`, model cache corruption detection +
+in-overlay clear, plus everything from v5 (in-app debug log overlay,
 `navigator.share` accepts files, `AndroidFS.stat()`, range/HEAD on
-localhost server, capability detection via `LWA.ready`. The doc tracks
+localhost server, capability detection via `LWA.ready`). The doc tracks
 the installed runtime — when CouchFlow gains new capabilities, this
 file is updated in the same commit.*
