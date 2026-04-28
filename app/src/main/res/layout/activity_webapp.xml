@@ -54,9 +54,12 @@
     <View
         android:id="@+id/debugTopZone"
         android:layout_width="match_parent"
-        android:layout_height="36dp"
+        android:layout_height="48dp"
         android:layout_gravity="top"
-        android:background="@android:color/transparent" />
+        android:background="@android:color/transparent"
+        android:clickable="true"
+        android:focusable="false"
+        android:elevation="100dp" />
 
     <ImageView
         android:id="@+id/debugButton"
