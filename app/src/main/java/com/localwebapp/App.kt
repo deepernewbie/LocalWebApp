@@ -2,6 +2,8 @@ package com.localwebapp
 
 import android.annotation.SuppressLint
 import android.content.ContentResolver
+import android.content.ContentValues
+import android.content.Context
 import android.content.Intent
 import android.graphics.Bitmap
 import android.graphics.Canvas
@@ -13,9 +15,12 @@ import android.media.MediaRecorder
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
+import android.os.Environment
+import android.provider.MediaStore
 import android.util.Base64
 import android.view.KeyEvent
 import android.view.LayoutInflater
+import android.view.MotionEvent
 import android.view.View
 import android.view.ViewGroup
 import android.view.WindowManager
@@ -33,7 +38,6 @@ import androidx.core.view.ViewCompat
 import androidx.core.view.WindowCompat
 import androidx.core.view.WindowInsetsCompat
 import androidx.core.view.WindowInsetsControllerCompat
-import androidx.core.view.updatePadding
 import androidx.documentfile.provider.DocumentFile
 import androidx.recyclerview.widget.LinearLayoutManager
 import androidx.recyclerview.widget.RecyclerView
@@ -52,15 +56,212 @@ import java.net.URLDecoder
 import java.text.SimpleDateFormat
 import java.util.*
 import java.util.concurrent.Executors
+import java.util.concurrent.atomic.AtomicLong
 import kotlin.concurrent.thread
 
-data class RecentProject(val name: String, val uri: String, val lastOpened: Long)
+// ═══════════════════════════════════════════════════════════════════════════════
+// DebugLog — thread-safe ring buffer of recent runtime events.
+//
+// Captures console output, errors, bridge calls, network requests, FS ops,
+// permission prompts, and lifecycle events. The user opens the overlay (via
+// triple-tap on the top edge or a persistent floating button) to view, copy,
+// share, or save the log. Designed for the prompt-AI -> run -> debug -> paste
+// -> ask-AI-again loop where the user has no laptop.
+//
+// Sensitive data scrubbing happens at push time:
+//   - URL query params named key/token/auth/password/apikey are stripped
+//   - base64-looking strings longer than 80 chars are truncated
+//   - file content payloads are never stored, only path + size + result
+// ═══════════════════════════════════════════════════════════════════════════════
+object DebugLog {
+
+    enum class Severity { TRACE, INFO, WARN, ERROR }
+    enum class Source   { CONSOLE, ERROR, BRIDGE, FETCH, FS, PERM, USER, LIFECYCLE, AUDIO }
+
+    data class Entry(
+        val tsEpochMs: Long,
+        val sessionMs: Long,
+        val severity:  Severity,
+        val source:    Source,
+        val message:   String
+    )
+
+    private const val MAX_ENTRIES = 2000
+    private const val MAX_BYTES   = 256 * 1024  // soft cap; we trim entries when exceeded
+
+    private val ring = ArrayDeque<Entry>(MAX_ENTRIES)
+    private val lock = Any()
+    private var byteEstimate = 0L
+
+    private val sessionStart = AtomicLong(System.currentTimeMillis())
+
+    // Session metadata captured once per WebApp launch
+    @Volatile var couchFlowVersion: String = "unknown"
+    @Volatile var webViewVersion:   String = "unknown"
+    @Volatile var deviceModel:      String = "${Build.MANUFACTURER} ${Build.MODEL}"
+    @Volatile var androidApi:       Int    = Build.VERSION.SDK_INT
+    @Volatile var projectName:      String = ""
+    @Volatile var entryUrl:         String = ""
+
+    /** Reset session timer and clear log. Call when launching a web app. */
+    fun startSession(project: String, entry: String) {
+        synchronized(lock) {
+            ring.clear()
+            byteEstimate = 0
+            sessionStart.set(System.currentTimeMillis())
+            projectName = project
+            entryUrl    = entry
+        }
+        push(Source.LIFECYCLE, Severity.INFO, "session started: $project")
+    }
+
+    fun push(source: Source, severity: Severity, message: String) {
+        val now      = System.currentTimeMillis()
+        val sessMs   = now - sessionStart.get()
+        val scrubbed = scrub(message)
+        val entry    = Entry(now, sessMs, severity, source, scrubbed)
+
+        synchronized(lock) {
+            ring.addLast(entry)
+            byteEstimate += scrubbed.length + 32 // rough overhead per entry
+
+            while (ring.size > MAX_ENTRIES || byteEstimate > MAX_BYTES) {
+                val removed = ring.removeFirst()
+                byteEstimate -= removed.message.length + 32
+            }
+        }
+
+        // Mirror to logcat for adb users (no-op on the user's phone but useful
+        // when developers run their own builds).
+        val logTag = "CF-${source.name}"
+        when (severity) {
+            Severity.ERROR -> android.util.Log.e(logTag, scrubbed)
+            Severity.WARN  -> android.util.Log.w(logTag, scrubbed)
+            Severity.INFO  -> android.util.Log.i(logTag, scrubbed)
+            Severity.TRACE -> android.util.Log.d(logTag, scrubbed)
+        }
+    }
+
+    fun snapshot(): List<Entry> = synchronized(lock) { ring.toList() }
+
+    fun clear() {
+        synchronized(lock) {
+            ring.clear()
+            byteEstimate = 0
+        }
+        push(Source.LIFECYCLE, Severity.INFO, "log cleared")
+    }
+
+    /** Render the log as a plain-text block formatted for AI consumption. */
+    fun renderForAi(): String {
+        val entries  = snapshot()
+        val now      = System.currentTimeMillis()
+        val durSec   = (now - sessionStart.get()) / 1000
+        val isoStart = SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ssZ", Locale.US)
+            .format(Date(sessionStart.get()))
+
+        val sb = StringBuilder()
+        sb.append("=== CouchFlow debug log ===\n")
+        sb.append("CouchFlow version: ").append(couchFlowVersion).append('\n')
+        sb.append("WebView: ").append(webViewVersion).append('\n')
+        sb.append("Device: ").append(deviceModel).append(", Android API ").append(androidApi).append('\n')
+        sb.append("Project: ").append(projectName).append('\n')
+        sb.append("Entry: ").append(entryUrl).append('\n')
+        sb.append("Session started: ").append(isoStart).append('\n')
+        sb.append("Session duration: ").append(durSec).append("s\n")
+        sb.append("Entry count: ").append(entries.size).append('\n')
+        sb.append('\n')
+        sb.append("--- Events (most recent first) ---\n")
+
+        val tsFmt = SimpleDateFormat("HH:mm:ss.SSS", Locale.US)
+        for (e in entries.reversed()) {
+            val ts  = tsFmt.format(Date(e.tsEpochMs))
+            val sev = e.severity.name.padEnd(5)
+            val src = e.source.name.padEnd(9)
+            sb.append('[').append(ts).append("] ")
+              .append(sev).append(' ')
+              .append(src).append(' ')
+              .append(e.message).append('\n')
+        }
+
+        sb.append("--- End log ---\n")
+        return sb.toString()
+    }
+
+    /** Truncate base64-ish strings and strip sensitive URL params. */
+    private fun scrub(message: String): String {
+        var s = message
+
+        // Strip sensitive query params from URLs in the message
+        val sensitiveKeys = listOf("key", "token", "auth", "password", "apikey", "api_key", "secret")
+        for (k in sensitiveKeys) {
+            val regex = Regex("([?&])${Regex.escape(k)}=([^&\\s]*)", RegexOption.IGNORE_CASE)
+            s = regex.replace(s) { mr -> "${mr.groupValues[1]}$k=<redacted>" }
+        }
+
+        // Truncate any single token longer than 80 chars that looks base64-ish
+        // (high alphanumeric+ratio, no spaces). This catches data: URIs, raw
+        // base64, hex blobs without flagging normal text.
+        val longTok = Regex("\\b([A-Za-z0-9+/=_-]{80,})\\b")
+        s = longTok.replace(s) { mr ->
+            val t = mr.groupValues[1]
+            "${t.take(40)}…<${t.length}ch>…${t.takeLast(20)}"
+        }
+
+        // data: URIs anywhere in the message
+        val dataUri = Regex("data:[^,\\s]+,[^\\s\"']{40,}")
+        s = dataUri.replace(s) { mr ->
+            val t = mr.value
+            val comma = t.indexOf(',')
+            "${t.substring(0, comma + 1)}<${t.length - comma - 1}ch base64>"
+        }
+
+        return s
+    }
+
+    /** Convenience helpers used throughout the runtime. */
+    fun console(level: String, msg: String) {
+        val sev = when (level.lowercase()) {
+            "error" -> Severity.ERROR
+            "warn", "warning" -> Severity.WARN
+            "info"  -> Severity.INFO
+            else    -> Severity.TRACE
+        }
+        push(Source.CONSOLE, sev, msg)
+    }
+    fun error(msg: String)                 = push(Source.ERROR,     Severity.ERROR, msg)
+    fun bridge(method: String, info: String, result: String) =
+        push(Source.BRIDGE, Severity.TRACE, "$method($info) -> $result")
+    fun fetch(method: String, url: String, status: Int, ms: Long) =
+        push(Source.FETCH, if (status in 200..299) Severity.TRACE else Severity.WARN,
+             "$method $url -> $status (${ms}ms)")
+    fun fs(op: String, path: String, result: String) =
+        push(Source.FS, Severity.TRACE, "$op($path) -> $result")
+    fun perm(name: String, granted: Boolean) =
+        push(Source.PERM, if (granted) Severity.INFO else Severity.WARN,
+             "$name -> ${if (granted) "granted" else "denied"}")
+    fun audio(event: String) = push(Source.AUDIO, Severity.INFO, event)
+    fun lifecycle(event: String) = push(Source.LIFECYCLE, Severity.INFO, event)
+    fun user(label: String, payload: String) =
+        push(Source.USER, Severity.INFO, "$label: $payload")
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// RecentProject + adapter
+// ═══════════════════════════════════════════════════════════════════════════════
+data class RecentProject(
+    val name: String,
+    val uri: String,
+    val lastOpened: Long,
+    val missing: Boolean = false
+)
 
 class RecentProjectsAdapter(
     private var projects: MutableList<RecentProject>,
     private val onOpen:     (RecentProject) -> Unit,
     private val onDelete:   (RecentProject) -> Unit,
-    private val onShortcut: (RecentProject) -> Unit
+    private val onShortcut: (RecentProject) -> Unit,
+    private val onRepick:   (RecentProject) -> Unit
 ) : RecyclerView.Adapter<RecentProjectsAdapter.ViewHolder>() {
 
     inner class ViewHolder(view: View) : RecyclerView.ViewHolder(view) {
@@ -79,9 +280,14 @@ class RecentProjectsAdapter(
     override fun onBindViewHolder(holder: ViewHolder, position: Int) {
         val project = projects[position]
         holder.name.text = project.name
-        val sdf = SimpleDateFormat("MMM dd, yyyy HH:mm", Locale.getDefault())
-        holder.date.text = "Last opened: ${sdf.format(Date(project.lastOpened))}"
-        holder.itemView.setOnClickListener    { onOpen(project) }
+        if (project.missing) {
+            holder.date.text = "Folder missing — tap to re-pick"
+            holder.itemView.setOnClickListener { onRepick(project) }
+        } else {
+            val sdf = SimpleDateFormat("MMM dd, yyyy HH:mm", Locale.getDefault())
+            holder.date.text = "Last opened: ${sdf.format(Date(project.lastOpened))}"
+            holder.itemView.setOnClickListener { onOpen(project) }
+        }
         holder.deleteBtn.setOnClickListener   { onDelete(project) }
         holder.shortcutBtn.setOnClickListener { onShortcut(project) }
     }
@@ -95,6 +301,9 @@ class RecentProjectsAdapter(
     }
 }
 
+// ═══════════════════════════════════════════════════════════════════════════════
+// MainActivity
+// ═══════════════════════════════════════════════════════════════════════════════
 class MainActivity : AppCompatActivity() {
 
     private lateinit var recyclerView: RecyclerView
@@ -176,12 +385,26 @@ class MainActivity : AppCompatActivity() {
                     .setPositiveButton("Remove") { _, _ -> removeProject(it.uri) }
                     .setNegativeButton("Cancel", null).show()
             },
-            onShortcut = { createShortcut(it) }
+            onShortcut = { createShortcut(it) },
+            onRepick   = { offerRepick(it) }
         )
         recyclerView.layoutManager = LinearLayoutManager(this)
         recyclerView.adapter = adapter
 
         fab.setOnClickListener { openFolderLauncher.launch(null) }
+        // Long-press the FAB to toggle the persistent debug button shown
+        // inside web apps. Off by default — triple-tapping the top edge of
+        // any web app also opens the debug overlay.
+        fab.setOnLongClickListener {
+            val current = prefs.getBoolean("debug_button_visible", false)
+            val next    = !current
+            prefs.edit().putBoolean("debug_button_visible", next).apply()
+            Toast.makeText(this,
+                if (next) "Debug button enabled. It will appear inside web apps."
+                else      "Debug button hidden. Triple-tap the top edge to open the log.",
+                Toast.LENGTH_LONG).show()
+            true
+        }
 
         // Let the FAB dodge the navigation bar inset so it clears the
         // Samsung gesture bar regardless of navigation mode.
@@ -205,6 +428,22 @@ class MainActivity : AppCompatActivity() {
         intent.putExtra(WebAppActivity.EXTRA_TITLE, name)
         startActivity(intent)
     }
+
+    private fun offerRepick(project: RecentProject) {
+        AlertDialog.Builder(this)
+            .setTitle("\"${project.name}\" folder is missing")
+            .setMessage("The original folder may have been moved, renamed, or its " +
+                    "permission revoked. Pick the folder again to restore access?")
+            .setPositiveButton("Pick folder") { _, _ ->
+                // Open picker; on success, the new URI replaces the old entry.
+                pendingRepickFor = project.uri
+                openFolderLauncher.launch(null)
+            }
+            .setNegativeButton("Remove from list") { _, _ -> removeProject(project.uri) }
+            .show()
+    }
+
+    private var pendingRepickFor: String? = null
 
     private fun createShortcut(project: RecentProject) {
         if (!ShortcutManagerCompat.isRequestPinShortcutSupported(this)) {
@@ -283,20 +522,40 @@ class MainActivity : AppCompatActivity() {
         catch (e: Exception) { JSONArray() }
     }
 
+    /**
+     * Load projects, marking entries as `missing` when the SAF URI is no
+     * longer accessible (folder was deleted/renamed/moved, or permission was
+     * revoked). The row stays in the list with a "Folder missing — re-pick"
+     * affordance instead of silently disappearing.
+     */
     private fun loadProjects() {
         val arr = loadJson()
         val list = (0 until arr.length()).map {
             val o = arr.getJSONObject(it)
-            RecentProject(o.getString("name"), o.getString("uri"), o.getLong("lastOpened"))
+            val uri  = o.getString("uri")
+            val name = o.getString("name")
+            val opened = o.getLong("lastOpened")
+            val missing = !isFolderAccessible(uri)
+            RecentProject(name, uri, opened, missing)
         }
         adapter.updateProjects(list)
         emptyView.visibility    = if (list.isEmpty()) View.VISIBLE else View.GONE
         recyclerView.visibility = if (list.isEmpty()) View.GONE    else View.VISIBLE
     }
+
+    private fun isFolderAccessible(uriStr: String): Boolean {
+        return try {
+            val uri  = Uri.parse(uriStr)
+            val doc  = DocumentFile.fromTreeUri(this, uri)
+            doc != null && doc.exists() && doc.isDirectory
+        } catch (e: Exception) {
+            false
+        }
+    }
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// NativeAudioRecorder
+// NativeAudioRecorder — instrumented with DebugLog calls for lifecycle events
 // ═══════════════════════════════════════════════════════════════════════════════
 class NativeAudioRecorder {
     companion object {
@@ -331,6 +590,7 @@ class NativeAudioRecorder {
             pcmBuffer.reset(); waveformIdx = 0; currentAmplitude = 0
             isPaused = false; isRecording = true
             rec.startRecording(); recorder = rec
+            DebugLog.audio("recorder started @ ${SAMPLE_RATE}Hz mono 16-bit")
             recordThread = thread(start = true, name = "NativeAudioCapture") {
                 val readBuf = ShortArray(minBufferSize)
                 val byteBuf = ByteArray(minBufferSize * 2)
@@ -359,13 +619,23 @@ class NativeAudioRecorder {
             }
             "ok"
         } catch (e: Exception) {
-            android.util.Log.e("NativeAudio", "Start failed", e)
+            DebugLog.error("audio start failed: ${e.message}")
             cleanup(); "error:${e.message ?: e.javaClass.simpleName}"
         }
     }
 
-    fun pauseRecording():  String { if (!isRecording) return "error:not recording"; isPaused = true;  return "ok" }
-    fun resumeRecording(): String { if (!isRecording) return "error:not recording"; isPaused = false; return "ok" }
+    fun pauseRecording():  String {
+        if (!isRecording) return "error:not recording"
+        isPaused = true
+        DebugLog.audio("recorder paused")
+        return "ok"
+    }
+    fun resumeRecording(): String {
+        if (!isRecording) return "error:not recording"
+        isPaused = false
+        DebugLog.audio("recorder resumed")
+        return "ok"
+    }
 
     fun stop(): String {
         if (!isRecording) return "error:not recording"
@@ -377,12 +647,17 @@ class NativeAudioRecorder {
             try { recorder?.release() } catch (e: Exception) {}
             recorder = null
             val pcmBytes = synchronized(pcmBuffer) { pcmBuffer.toByteArray() }
-            if (pcmBytes.isEmpty()) return "error:empty recording"
+            if (pcmBytes.isEmpty()) {
+                DebugLog.audio("recorder stopped: empty recording")
+                return "error:empty recording"
+            }
             val wavBytes = pcmToWav(pcmBytes, SAMPLE_RATE, NUM_CHANNELS, BYTES_PER_SAMPLE * 8)
             val base64   = Base64.encodeToString(wavBytes, Base64.NO_WRAP)
+            DebugLog.audio("recorder stopped: ${pcmBytes.size}B PCM -> ${wavBytes.size}B WAV")
             pcmBuffer.reset()
             "data:audio/wav;base64,$base64"
         } catch (e: Exception) {
+            DebugLog.error("audio stop failed: ${e.message}")
             cleanup(); "error:${e.message ?: e.javaClass.simpleName}"
         }
     }
@@ -441,10 +716,11 @@ class NativeAudioRecorder {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// JsFilesystemBridge — exposed as AndroidFS_native
+// JsFilesystemBridge — instrumented; logs each FS op with path + result, never
+// the file content. New AndroidFS_native.stat() returns "size|mtime|isDir".
 // ═══════════════════════════════════════════════════════════════════════════════
 class JsFilesystemBridge(
-    private val ctx: android.content.Context,
+    private val ctx: Context,
     private val resolver: ContentResolver,
     private val rootUri: Uri
 ) {
@@ -470,28 +746,36 @@ class JsFilesystemBridge(
 
     @JavascriptInterface
     fun read(path: String): String? {
-        return try {
-            val file = resolvePath(path, false) ?: return null
-            if (!file.isFile) return null
-            resolver.openInputStream(file.uri)?.use { it.readBytes() }
+        val r = try {
+            val file = resolvePath(path, false)
+            if (file == null || !file.isFile) null
+            else resolver.openInputStream(file.uri)?.use { it.readBytes() }
                 ?.toString(Charsets.UTF_8)
         } catch (e: Exception) {
-            android.util.Log.e("CF-FS", "read $path: ${e.message}")
-            null
+            DebugLog.fs("read", path, "error:${e.message}")
+            return null
         }
+        DebugLog.fs("read", path, if (r == null) "null" else "${r.length}ch")
+        return r
     }
 
     @JavascriptInterface
     fun write(path: String, content: String): String {
         return try {
-            val file = resolvePath(path, true) ?: return "error:path"
+            val file = resolvePath(path, true)
+            if (file == null) {
+                DebugLog.fs("write", path, "error:path"); return "error:path"
+            }
             val bytes = content.toByteArray(Charsets.UTF_8)
             val stream = resolver.openOutputStream(file.uri, "wt")
-                ?: return "error:no output stream"
+            if (stream == null) {
+                DebugLog.fs("write", path, "error:no output stream"); return "error:no output stream"
+            }
             stream.use { it.write(bytes) }
+            DebugLog.fs("write", path, "${bytes.size}B ok")
             "ok"
         } catch (e: Exception) {
-            android.util.Log.e("CF-FS", "write $path: ${e.message}")
+            DebugLog.fs("write", path, "error:${e.message}")
             "error:${e.message}"
         }
     }
@@ -499,12 +783,18 @@ class JsFilesystemBridge(
     @JavascriptInterface
     fun readBase64(path: String): String? {
         return try {
-            val file = resolvePath(path, false) ?: return null
-            if (!file.isFile) return null
+            val file = resolvePath(path, false)
+            if (file == null || !file.isFile) {
+                DebugLog.fs("readBase64", path, "null"); return null
+            }
             val bytes = resolver.openInputStream(file.uri)?.use { it.readBytes() }
-                ?: return null
+            if (bytes == null) {
+                DebugLog.fs("readBase64", path, "null"); return null
+            }
+            DebugLog.fs("readBase64", path, "${bytes.size}B ok")
             Base64.encodeToString(bytes, Base64.NO_WRAP)
         } catch (e: Exception) {
+            DebugLog.fs("readBase64", path, "error:${e.message}")
             null
         }
     }
@@ -512,13 +802,20 @@ class JsFilesystemBridge(
     @JavascriptInterface
     fun writeBase64(path: String, b64: String): String {
         return try {
-            val file = resolvePath(path, true) ?: return "error:path"
+            val file = resolvePath(path, true)
+            if (file == null) {
+                DebugLog.fs("writeBase64", path, "error:path"); return "error:path"
+            }
             val bytes = Base64.decode(b64, Base64.DEFAULT)
             val stream = resolver.openOutputStream(file.uri, "wt")
-                ?: return "error:no output stream"
+            if (stream == null) {
+                DebugLog.fs("writeBase64", path, "error:no output stream"); return "error:no output stream"
+            }
             stream.use { it.write(bytes) }
+            DebugLog.fs("writeBase64", path, "${bytes.size}B ok")
             "ok"
         } catch (e: Exception) {
+            DebugLog.fs("writeBase64", path, "error:${e.message}")
             "error:${e.message}"
         }
     }
@@ -526,9 +823,15 @@ class JsFilesystemBridge(
     @JavascriptInterface
     fun deleteFile(path: String): String {
         return try {
-            val file = resolvePath(path, false) ?: return "error:not found"
-            if (file.delete()) "ok" else "error:delete failed"
+            val file = resolvePath(path, false)
+            if (file == null) {
+                DebugLog.fs("delete", path, "error:not found"); return "error:not found"
+            }
+            val ok = file.delete()
+            DebugLog.fs("delete", path, if (ok) "ok" else "error:delete failed")
+            if (ok) "ok" else "error:delete failed"
         } catch (e: Exception) {
+            DebugLog.fs("delete", path, "error:${e.message}")
             "error:${e.message}"
         }
     }
@@ -555,8 +858,12 @@ class JsFilesystemBridge(
                     if (failed) null else n
                 }
             }
-            if (node == null) "" else node.listFiles().mapNotNull { it.name }.joinToString("\n")
+            val result = if (node == null) "" else node.listFiles().mapNotNull { it.name }.joinToString("\n")
+            val count = if (result.isEmpty()) 0 else result.count { it == '\n' } + 1
+            DebugLog.fs("list", path.ifEmpty { "/" }, "$count items")
+            result
         } catch (e: Exception) {
+            DebugLog.fs("list", path, "error:${e.message}")
             ""
         }
     }
@@ -565,8 +872,11 @@ class JsFilesystemBridge(
     fun exists(path: String): Boolean {
         return try {
             val file = resolvePath(path, false)
-            file != null && file.exists()
+            val ok = file != null && file.exists()
+            DebugLog.fs("exists", path, ok.toString())
+            ok
         } catch (e: Exception) {
+            DebugLog.fs("exists", path, "error:${e.message}")
             false
         }
     }
@@ -577,20 +887,55 @@ class JsFilesystemBridge(
             val root = DocumentFile.fromTreeUri(ctx, rootUri) ?: return "error:root"
             val segments = path.split("/", "\\")
                 .filter { it.isNotEmpty() && it != ".." && it != "." }
-            if (segments.isEmpty()) return "error:empty path"
+            if (segments.isEmpty()) {
+                DebugLog.fs("mkdir", path, "error:empty path"); return "error:empty path"
+            }
             var node: DocumentFile = root
             for (name in segments) {
                 val child = node.findFile(name)
                 node = if (child != null && child.isDirectory) child
-                       else node.createDirectory(name) ?: return "error:mkdir $name"
+                       else node.createDirectory(name) ?: run {
+                           DebugLog.fs("mkdir", path, "error:create $name")
+                           return "error:mkdir $name"
+                       }
             }
+            DebugLog.fs("mkdir", path, "ok")
             "ok"
         } catch (e: Exception) {
+            DebugLog.fs("mkdir", path, "error:${e.message}")
             "error:${e.message}"
+        }
+    }
+
+    /**
+     * Returns "size|mtime|isDir" or null. mtime in milliseconds since epoch,
+     * size in bytes (0 for directories). The shim parses this into an object.
+     * Lets web apps build list views without round-tripping content.
+     */
+    @JavascriptInterface
+    fun stat(path: String): String? {
+        return try {
+            val file = resolvePath(path, false)
+            if (file == null || !file.exists()) {
+                DebugLog.fs("stat", path, "null"); return null
+            }
+            val size  = if (file.isFile) file.length() else 0L
+            val mtime = file.lastModified()
+            val isDir = file.isDirectory
+            val result = "$size|$mtime|$isDir"
+            DebugLog.fs("stat", path, result)
+            result
+        } catch (e: Exception) {
+            DebugLog.fs("stat", path, "error:${e.message}")
+            null
         }
     }
 }
 
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// WebAppActivity — fullscreen WebView, edge-respecting layout, debug overlay
+// ═══════════════════════════════════════════════════════════════════════════════
 class WebAppActivity : AppCompatActivity() {
 
     companion object {
@@ -598,23 +943,63 @@ class WebAppActivity : AppCompatActivity() {
         const val EXTRA_TITLE = "extra_title"
         private const val NET_CACHE = "netcache"
 
+        // Updated shim adds:
+        //   - window.CouchFlow.debug(label, payload) -> pushes USER event
+        //   - global error/unhandledrejection listeners that surface to the log
+        //   - AndroidFS.stat() returning {size, mtime, isDir}
+        // No web-app-visible API removed; everything from v3 still works.
         private const val LWA_SHIM_JS = """
 (function(){
-  if (window.__couchflow_shim_v3) return;
-  window.__couchflow_shim_v3 = true;
+  if (window.__couchflow_shim_v4) return;
+  window.__couchflow_shim_v4 = true;
 
   var features = [];
   var readyResolve;
   var readyPromise = new Promise(function(r){ readyResolve = r; });
 
   var lwaObj = {
-    version:  'v3',
+    version:  'v4',
     features: features,
     ready:    readyPromise,
     isNative: typeof Android !== 'undefined' && typeof Android.isNativeApp === 'function'
   };
+
+  // Optional debug-event API. Web apps that don't call this still get full
+  // automatic capture. Apps that do call it get richer logs to share with
+  // their AI assistant when something goes wrong.
+  function debugPush(label, payload) {
+    try {
+      if (typeof Android !== 'undefined' && Android.debugUserEvent) {
+        var s;
+        try { s = (typeof payload === 'string') ? payload : JSON.stringify(payload); }
+        catch(e) { s = String(payload); }
+        Android.debugUserEvent(String(label), s == null ? '' : s);
+      }
+    } catch(e) {}
+  }
+  lwaObj.debug = debugPush;
+
   window.LWA = lwaObj;
   window.CouchFlow = lwaObj;
+
+  // Surface uncaught errors and rejections to the native log so the user can
+  // share them with their AI without needing devtools.
+  window.addEventListener('error', function(ev) {
+    try {
+      var msg = (ev.message || 'error') +
+                (ev.filename ? ' @ ' + ev.filename + ':' + (ev.lineno||0) + ':' + (ev.colno||0) : '') +
+                (ev.error && ev.error.stack ? '\n' + ev.error.stack : '');
+      if (typeof Android !== 'undefined' && Android.debugError) Android.debugError(msg);
+    } catch(_) {}
+  });
+  window.addEventListener('unhandledrejection', function(ev) {
+    try {
+      var reason = ev.reason;
+      var msg = 'Unhandled promise rejection: ' +
+        (reason && reason.stack ? reason.stack : (reason && reason.message ? reason.message : String(reason)));
+      if (typeof Android !== 'undefined' && Android.debugError) Android.debugError(msg);
+    } catch(_) {}
+  });
 
   if (typeof Android !== 'undefined' && typeof Android.recStart === 'function') {
     features.push('audio');
@@ -890,6 +1275,20 @@ class WebAppActivity : AppCompatActivity() {
         return new Promise(function(res){
           try { res(FSB.mkdir(String(path)) === 'ok'); } catch(e) { res(false); }
         });
+      },
+      stat: function(path) {
+        return new Promise(function(res){
+          try {
+            var s = FSB.stat(String(path));
+            if (!s) return res(null);
+            var parts = s.split('|');
+            res({
+              size:  parseInt(parts[0], 10) || 0,
+              mtime: parseInt(parts[1], 10) || 0,
+              isDir: parts[2] === 'true'
+            });
+          } catch(e) { res(null); }
+        });
       }
     };
 
@@ -939,15 +1338,15 @@ class WebAppActivity : AppCompatActivity() {
   }
 
   if (typeof Android !== 'undefined') {
-    features.push('share', 'vibrate', 'toast');
+    features.push('share', 'vibrate', 'toast', 'debug');
   }
 
   readyResolve({
     features: features.slice(),
-    version:  'v3',
+    version:  'v4',
     isNative: lwaObj.isNative
   });
-  console.log('[CouchFlow] shim v3 ready — features:', features.join(','));
+  console.log('[CouchFlow] shim v4 ready - features:', features.join(','));
 })();
 """
     }
@@ -956,6 +1355,8 @@ class WebAppActivity : AppCompatActivity() {
     private lateinit var progressBar: ProgressBar
     private lateinit var errorView: View
     private lateinit var errorText: TextView
+    private lateinit var debugButton: View
+    private lateinit var debugTopZone: View
 
     private var server: SimpleServer? = null
     private var pendingPermissionRequest: PermissionRequest? = null
@@ -967,13 +1368,27 @@ class WebAppActivity : AppCompatActivity() {
     private val nativeRecorder = NativeAudioRecorder()
     private var fsBridge: JsFilesystemBridge? = null
 
+    // Triple-tap detector for the top edge — opens the debug overlay even when
+    // the persistent debug button is hidden.
+    private val tripleTapTimes = LongArray(3)
+    private var tripleTapIdx = 0
+    private val TRIPLE_TAP_WINDOW_MS = 800L
+
     private val startupPermsLauncher =
-        registerForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) { _ ->
+        registerForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) { results ->
+            // Log permission outcomes so the user can show their AI assistant
+            // when something doesn't work due to denied permissions.
+            for ((perm, granted) in results) {
+                DebugLog.perm(perm.substringAfterLast('.').lowercase(), granted)
+            }
             initializeWebApp()
         }
 
     private val runtimePermsLauncher =
         registerForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) { results ->
+            for ((perm, granted) in results) {
+                DebugLog.perm(perm.substringAfterLast('.').lowercase(), granted)
+            }
             val allGranted = results.values.all { it }
             val pending    = pendingPermissionRequest
             if (pending != null) {
@@ -1005,20 +1420,15 @@ class WebAppActivity : AppCompatActivity() {
 
     private val netCacheDir by lazy { File(filesDir, NET_CACHE).also { it.mkdirs() } }
 
-    @SuppressLint("SetJavaScriptEnabled")
+    @SuppressLint("SetJavaScriptEnabled", "ClickableViewAccessibility")
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
 
-        // Do NOT go edge-to-edge. The status bar (top) and navigation /
-        // gesture bar (bottom) keep their own space. The WebView fills
-        // only the safe area between them — so the web app's `top: 0`
-        // sits just under the status bar and `bottom: 24px` sits just
-        // above the gesture bar. No overlap, no clipping.
-        //
-        // syncStatusBarToWebView() is still called on page load and it
-        // tints both bars to the web app's theme color — so visually the
-        // screen still looks unified from top to bottom, just without
-        // any content getting hidden behind the system UI.
+        // System bars keep their own space. Web apps render only in the safe
+        // area between status bar and gesture bar — `top: 0` and `bottom: 24px`
+        // refer to visible coordinates, no overlap or clipping. We still tint
+        // both bars to the web app's theme color (see syncStatusBarToWebView)
+        // so the screen looks unified.
         WindowCompat.setDecorFitsSystemWindows(window, true)
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
             window.isStatusBarContrastEnforced     = false
@@ -1032,11 +1442,48 @@ class WebAppActivity : AppCompatActivity() {
         folderUri  = Uri.parse(uriStr)
         appTitle   = intent.getStringExtra(EXTRA_TITLE) ?: "Web App"
 
-        webView     = findViewById(R.id.webView)
-        progressBar = findViewById(R.id.progressBar)
-        errorView   = findViewById(R.id.errorView)
-        errorText   = findViewById(R.id.errorText)
+        webView      = findViewById(R.id.webView)
+        progressBar  = findViewById(R.id.progressBar)
+        errorView    = findViewById(R.id.errorView)
+        errorText    = findViewById(R.id.errorText)
+        debugButton  = findViewById(R.id.debugButton)
+        debugTopZone = findViewById(R.id.debugTopZone)
         progressBar.visibility = View.VISIBLE
+
+        // Initialize debug log session metadata
+        DebugLog.couchFlowVersion = try {
+            packageManager.getPackageInfo(packageName, 0).versionName ?: "unknown"
+        } catch (e: Exception) { "unknown" }
+        DebugLog.webViewVersion = try {
+            WebView.getCurrentWebViewPackage()?.versionName ?: "unknown"
+        } catch (e: Exception) { "unknown" }
+        DebugLog.startSession(appTitle, uriStr)
+
+        // Persistent debug button — hidden by default. Long-press the FAB on
+        // the home screen to enable.
+        val prefs = getSharedPreferences("CouchFlow", MODE_PRIVATE)
+        val debugBtnVisible = prefs.getBoolean("debug_button_visible", false)
+        debugButton.visibility = if (debugBtnVisible) View.VISIBLE else View.GONE
+        debugButton.setOnClickListener { openDebugOverlay() }
+
+        // Top-edge invisible zone for triple-tap. Layout puts it ~36dp tall
+        // across the top, with no background — taps that don't land here
+        // pass through to the WebView normally.
+        debugTopZone.setOnTouchListener { _, ev ->
+            if (ev.action == MotionEvent.ACTION_UP) {
+                tripleTapTimes[tripleTapIdx] = System.currentTimeMillis()
+                tripleTapIdx = (tripleTapIdx + 1) % tripleTapTimes.size
+                val now    = System.currentTimeMillis()
+                val oldest = tripleTapTimes.min()
+                if (oldest > 0 && (now - oldest) < TRIPLE_TAP_WINDOW_MS) {
+                    // Reset so we don't immediately fire again
+                    for (i in tripleTapTimes.indices) tripleTapTimes[i] = 0
+                    openDebugOverlay()
+                    return@setOnTouchListener true
+                }
+            }
+            false
+        }
 
         val neededPerms = mutableListOf<String>()
         if (checkSelfPermission(android.Manifest.permission.RECORD_AUDIO)
@@ -1050,12 +1497,18 @@ class WebAppActivity : AppCompatActivity() {
         else startupPermsLauncher.launch(neededPerms.toTypedArray())
     }
 
+    private fun openDebugOverlay() {
+        DebugLog.lifecycle("debug overlay opened")
+        startActivity(Intent(this, DebugOverlayActivity::class.java))
+    }
+
     private fun initializeWebApp() {
         fsBridge = JsFilesystemBridge(this, contentResolver, folderUri)
         val s = SimpleServer(contentResolver, folderUri, filesDir, LWA_SHIM_JS)
         server = s; s.start()
         setupWebView()
         webView.loadUrl("http://localhost:${s.port}/")
+        DebugLog.lifecycle("webview loaded http://localhost:${s.port}/")
     }
 
     private fun syncStatusBarToWebView() {
@@ -1082,9 +1535,7 @@ class WebAppActivity : AppCompatActivity() {
     private fun parseCssColor(css: String): Int? {
         val s = css.trim()
         try {
-            if (s.startsWith("#")) {
-                return android.graphics.Color.parseColor(s)
-            }
+            if (s.startsWith("#")) return android.graphics.Color.parseColor(s)
             if (s.startsWith("rgb")) {
                 val inside = s.substringAfter('(').substringBefore(')')
                 val parts  = inside.split(',').map { it.trim() }
@@ -1096,9 +1547,7 @@ class WebAppActivity : AppCompatActivity() {
                 }
             }
             return android.graphics.Color.parseColor(s)
-        } catch (e: Exception) {
-            return null
-        }
+        } catch (e: Exception) { return null }
     }
 
     private fun applyBarColor(color: Int) {
@@ -1131,46 +1580,91 @@ class WebAppActivity : AppCompatActivity() {
         }
         webView.setBackgroundColor(android.graphics.Color.BLACK)
 
+        // Single Android bridge object. Each method logs to DebugLog so the
+        // user can see exactly which calls happened in what order.
         webView.addJavascriptInterface(object : Any() {
-            @JavascriptInterface fun toast(msg: String) = runOnUiThread {
+            @JavascriptInterface fun toast(msg: String): Unit = runOnUiThread {
+                DebugLog.bridge("Android.toast", "\"${truncate(msg, 80)}\"", "ok")
                 Toast.makeText(this@WebAppActivity, msg, Toast.LENGTH_SHORT).show()
             }
-            @JavascriptInterface fun log(msg: String) = android.util.Log.d("CouchFlow", msg)
-            @JavascriptInterface fun isNativeApp() = true
-            @JavascriptInterface fun getPlatform() = "android"
-            @JavascriptInterface fun getAppVersion(): String =
-                packageManager.getPackageInfo(packageName, 0).versionName ?: "1.0"
-            @JavascriptInterface fun share(text: String) = runOnUiThread {
+            @JavascriptInterface fun log(msg: String) {
+                DebugLog.bridge("Android.log", "\"${truncate(msg, 80)}\"", "ok")
+                android.util.Log.d("CouchFlow", msg)
+            }
+            @JavascriptInterface fun isNativeApp(): Boolean {
+                DebugLog.bridge("Android.isNativeApp", "", "true")
+                return true
+            }
+            @JavascriptInterface fun getPlatform(): String {
+                DebugLog.bridge("Android.getPlatform", "", "android")
+                return "android"
+            }
+            @JavascriptInterface fun getAppVersion(): String {
+                val v = packageManager.getPackageInfo(packageName, 0).versionName ?: "1.0"
+                DebugLog.bridge("Android.getAppVersion", "", v)
+                return v
+            }
+            @JavascriptInterface fun share(text: String): Unit = runOnUiThread {
+                DebugLog.bridge("Android.share", "\"${truncate(text, 60)}\"", "intent")
                 startActivity(Intent.createChooser(
                     Intent(Intent.ACTION_SEND).apply {
                         type = "text/plain"; putExtra(Intent.EXTRA_TEXT, text)
                     }, "Share"))
             }
-            @JavascriptInterface fun vibrate() = runOnUiThread {
-                val v = getSystemService(android.content.Context.VIBRATOR_SERVICE) as android.os.Vibrator
+            @JavascriptInterface fun vibrate(): Unit = runOnUiThread {
+                DebugLog.bridge("Android.vibrate", "", "ok")
+                val v = getSystemService(Context.VIBRATOR_SERVICE) as android.os.Vibrator
                 if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O)
                     v.vibrate(android.os.VibrationEffect.createOneShot(100, android.os.VibrationEffect.DEFAULT_AMPLITUDE))
                 else @Suppress("DEPRECATION") v.vibrate(100)
             }
             @JavascriptInterface fun getFreeMB(): String {
-                return try {
+                val mb = try {
                     val stat = android.os.StatFs(filesDir.path)
                     (stat.availableBlocksLong * stat.blockSizeLong / 1048576).toString()
                 } catch (e: Exception) { "0" }
+                DebugLog.bridge("Android.getFreeMB", "", mb)
+                return mb
             }
 
-            @JavascriptInterface fun recStart():  String  = nativeRecorder.start()
-            @JavascriptInterface fun recStop():   String  = nativeRecorder.stop()
-            @JavascriptInterface fun recPause():  String  = nativeRecorder.pauseRecording()
-            @JavascriptInterface fun recResume(): String  = nativeRecorder.resumeRecording()
+            @JavascriptInterface fun recStart():  String  {
+                val r = nativeRecorder.start()
+                DebugLog.bridge("Android.recStart", "", r); return r
+            }
+            @JavascriptInterface fun recStop():   String  {
+                val r = nativeRecorder.stop()
+                DebugLog.bridge("Android.recStop", "",
+                    if (r.startsWith("data:")) "data:audio/wav (${r.length}ch)" else r)
+                return r
+            }
+            @JavascriptInterface fun recPause():  String  {
+                val r = nativeRecorder.pauseRecording()
+                DebugLog.bridge("Android.recPause", "", r); return r
+            }
+            @JavascriptInterface fun recResume(): String  {
+                val r = nativeRecorder.resumeRecording()
+                DebugLog.bridge("Android.recResume", "", r); return r
+            }
             @JavascriptInterface fun recAmplitude(): Int  = nativeRecorder.getAmplitude()
             @JavascriptInterface fun recWaveform(count: Int): String = nativeRecorder.getWaveform(count)
             @JavascriptInterface fun recIsActive(): Boolean = nativeRecorder.isActive()
             @JavascriptInterface fun recIsPaused(): Boolean = nativeRecorder.isPausedState()
 
             @JavascriptInterface fun setBarColor(cssColor: String) {
+                DebugLog.bridge("Android.setBarColor", "\"$cssColor\"", "ok")
                 val parsed = parseCssColor(cssColor) ?: return
                 runOnUiThread { applyBarColor(parsed) }
+            }
+
+            // Debug log push API. Web apps call CouchFlow.debug(label, payload)
+            // and that shim function calls this method. payloadJson is already
+            // a JSON-stringified value (or empty string if no payload).
+            @JavascriptInterface fun debugUserEvent(label: String, payloadJson: String) {
+                DebugLog.user(label, truncate(payloadJson, 200))
+            }
+            // Surfaces uncaught errors and unhandled rejections from the page.
+            @JavascriptInterface fun debugError(msg: String) {
+                DebugLog.error(truncate(msg, 1000))
             }
         }, "Android")
 
@@ -1180,9 +1674,11 @@ class WebAppActivity : AppCompatActivity() {
             override fun onPageStarted(v: WebView, url: String, f: Bitmap?) {
                 progressBar.visibility = View.VISIBLE
                 errorView.visibility   = View.GONE
+                DebugLog.lifecycle("page started: ${truncate(url, 120)}")
             }
             override fun onPageFinished(v: WebView, url: String) {
                 progressBar.visibility = View.GONE
+                DebugLog.lifecycle("page finished: ${truncate(url, 120)}")
                 syncStatusBarToWebView()
             }
             override fun onReceivedError(v: WebView, req: WebResourceRequest, err: WebResourceError) {
@@ -1190,6 +1686,7 @@ class WebAppActivity : AppCompatActivity() {
                     progressBar.visibility = View.GONE
                     errorView.visibility   = View.VISIBLE
                     errorText.text         = "Error: ${err.description}"
+                    DebugLog.error("page error: ${err.errorCode} ${err.description}")
                 }
             }
             override fun shouldOverrideUrlLoading(v: WebView, req: WebResourceRequest): Boolean {
@@ -1206,13 +1703,23 @@ class WebAppActivity : AppCompatActivity() {
                 if (method != "GET")   return null
                 if (!shouldCache(url)) return null
                 val cacheFile = urlToCacheFile(url)
-                if (cacheFile.exists() && cacheFile.length() > 0) return streamFromDisk(cacheFile, url)
+                if (cacheFile.exists() && cacheFile.length() > 0) {
+                    DebugLog.fetch("CACHE", url, 200, 0)
+                    return streamFromDisk(cacheFile, url)
+                }
+                val started = System.currentTimeMillis()
                 return try {
                     val conn = openConnection(url, request)
                     val code = conn.responseCode
-                    if (code !in 200..299) { conn.disconnect(); return null }
+                    if (code !in 200..299) {
+                        conn.disconnect()
+                        DebugLog.fetch("GET", url, code, System.currentTimeMillis() - started)
+                        return null
+                    }
                     val contentType = conn.contentType ?: guessMime(url)
-                    if (contentType.contains("text/html")) { conn.disconnect(); return null }
+                    if (contentType.contains("text/html")) {
+                        conn.disconnect(); return null
+                    }
                     cacheFile.parentFile?.mkdirs()
                     val tmpFile = File(cacheFile.parent, "${cacheFile.name}.tmp")
                     tmpFile.delete()
@@ -1225,10 +1732,16 @@ class WebAppActivity : AppCompatActivity() {
                         }
                         tmpFile.renameTo(cacheFile)
                     } catch (e: Exception) {
-                        tmpFile.delete(); conn.disconnect(); return null
+                        tmpFile.delete(); conn.disconnect()
+                        DebugLog.fetch("GET", url, -1, System.currentTimeMillis() - started)
+                        return null
                     } finally { conn.disconnect() }
+                    DebugLog.fetch("GET", url, code, System.currentTimeMillis() - started)
                     if (cacheFile.exists() && cacheFile.length() > 0) streamFromDisk(cacheFile, url) else null
-                } catch (e: Exception) { null }
+                } catch (e: Exception) {
+                    DebugLog.fetch("GET", url, -1, System.currentTimeMillis() - started)
+                    null
+                }
             }
         }
 
@@ -1238,8 +1751,9 @@ class WebAppActivity : AppCompatActivity() {
                 if (p == 100) progressBar.visibility = View.GONE
             }
             override fun onConsoleMessage(m: ConsoleMessage): Boolean {
-                android.util.Log.d("CouchFlow-JS",
-                    "[${m.messageLevel()}] ${m.message()} (line ${m.lineNumber()})")
+                val level = m.messageLevel().name
+                val msg   = "${m.message()} (${m.sourceId().substringAfterLast('/')}:${m.lineNumber()})"
+                DebugLog.console(level, msg)
                 return true
             }
             override fun onJsAlert(view: WebView, url: String, message: String, result: JsResult): Boolean {
@@ -1285,17 +1799,21 @@ class WebAppActivity : AppCompatActivity() {
             }
             override fun onGeolocationPermissionsShowPrompt(origin: String, callback: GeolocationPermissions.Callback) {
                 val fine = android.Manifest.permission.ACCESS_FINE_LOCATION
-                val coarse = android.Manifest.permission.ACCESS_COARSE_LOCATION
-                if (checkSelfPermission(fine) == android.content.pm.PackageManager.PERMISSION_GRANTED)
+                if (checkSelfPermission(fine) == android.content.pm.PackageManager.PERMISSION_GRANTED) {
+                    DebugLog.perm("location", true)
                     callback.invoke(origin, true, false)
-                else {
+                } else {
                     AlertDialog.Builder(this@WebAppActivity)
                         .setTitle("Location Access")
                         .setPositiveButton("Allow") { _, _ ->
-                            runtimePermsLauncher.launch(arrayOf(fine, coarse))
+                            runtimePermsLauncher.launch(arrayOf(fine,
+                                android.Manifest.permission.ACCESS_COARSE_LOCATION))
                             callback.invoke(origin, true, false)
                         }
-                        .setNegativeButton("Deny") { _, _ -> callback.invoke(origin, false, false) }.show()
+                        .setNegativeButton("Deny") { _, _ ->
+                            DebugLog.perm("location", false)
+                            callback.invoke(origin, false, false)
+                        }.show()
                 }
             }
             override fun onShowFileChooser(webView: WebView, callback: ValueCallback<Array<Uri>>,
@@ -1345,6 +1863,9 @@ class WebAppActivity : AppCompatActivity() {
             }
         }
     }
+
+    private fun truncate(s: String, max: Int): String =
+        if (s.length <= max) s else "${s.take(max - 1)}…"
 
     private fun streamFromDisk(file: File, url: String): WebResourceResponse {
         return WebResourceResponse(
@@ -1419,13 +1940,27 @@ class WebAppActivity : AppCompatActivity() {
         if (nativeRecorder.isActive()) nativeRecorder.stop()
         server?.stop()
         webView.destroy()
+        DebugLog.lifecycle("activity destroyed")
     }
-    override fun onPause()  { super.onPause();  webView.onPause()  }
-    override fun onResume() { super.onResume(); webView.onResume() }
+    override fun onPause()  {
+        super.onPause();  webView.onPause();  DebugLog.lifecycle("paused")
+    }
+    override fun onResume() {
+        super.onResume(); webView.onResume(); DebugLog.lifecycle("resumed")
+        // Refresh debug button visibility in case the user toggled it.
+        val prefs = getSharedPreferences("CouchFlow", MODE_PRIVATE)
+        val debugBtnVisible = prefs.getBoolean("debug_button_visible", false)
+        debugButton.visibility = if (debugBtnVisible) View.VISIBLE else View.GONE
+    }
+    override fun onLowMemory() {
+        super.onLowMemory(); DebugLog.lifecycle("low memory warning")
+    }
 }
 
+
 // ═══════════════════════════════════════════════════════════════════════════════
-// SimpleServer
+// SimpleServer — HTTP server with stable port, HTML shim injection, and Range
+// support so <audio> / <video> elements can scrub through media files.
 // ═══════════════════════════════════════════════════════════════════════════════
 class SimpleServer(
     private val resolver: ContentResolver,
@@ -1441,9 +1976,9 @@ class SimpleServer(
 
     private val injectedHead: ByteArray by lazy {
         val sb = StringBuilder()
-        sb.append("<meta name=\"lwa-features\" content=\"fs,audio,share,vibrate\">\n")
-        sb.append("<meta name=\"lwa-version\" content=\"v3\">\n")
-        sb.append("<meta name=\"couchflow-version\" content=\"v3\">\n")
+        sb.append("<meta name=\"lwa-features\" content=\"fs,audio,share,vibrate,debug\">\n")
+        sb.append("<meta name=\"lwa-version\" content=\"v4\">\n")
+        sb.append("<meta name=\"couchflow-version\" content=\"v4\">\n")
         sb.append("<script data-couchflow=\"shim\">")
         sb.append(shimJs)
         sb.append("</script>\n")
@@ -1460,8 +1995,7 @@ class SimpleServer(
                 bound = true
                 android.util.Log.d("CouchFlow-Server", "Bound stable port $port for $rootUri")
                 break
-            } catch (e: Exception) {
-            }
+            } catch (e: Exception) { }
         }
         if (!bound) {
             serverSocket = ServerSocket(0).also { port = it.localPort }
@@ -1485,30 +2019,66 @@ class SimpleServer(
         executor.shutdownNow()
     }
 
-    private fun handle(s: java.net.Socket) {
-        val reader = s.inputStream.bufferedReader(Charsets.ISO_8859_1)
-        val out    = s.outputStream
-        val line   = reader.readLine() ?: return
-        val parts  = line.trim().split(" ")
-        if (parts.size < 2) return
-        var path   = URLDecoder.decode(parts[1].substringBefore("?"), "UTF-8")
+    private data class ParsedRequest(
+        val method: String,
+        val path: String,
+        val rangeStart: Long?,
+        val rangeEnd: Long?
+    )
+
+    private fun parseRequest(reader: java.io.BufferedReader): ParsedRequest? {
+        val line = reader.readLine() ?: return null
+        val parts = line.trim().split(" ")
+        if (parts.size < 2) return null
+        val method = parts[0].uppercase()
+        val path = URLDecoder.decode(parts[1].substringBefore("?"), "UTF-8")
+
+        var rangeHeader: String? = null
         do {
             val h = reader.readLine() ?: break
             if (h.isBlank()) break
+            if (h.startsWith("Range:", ignoreCase = true)) {
+                rangeHeader = h.substringAfter(":").trim()
+            }
         } while (true)
+
+        var start: Long? = null
+        var end: Long? = null
+        if (rangeHeader != null && rangeHeader.startsWith("bytes=")) {
+            val spec = rangeHeader.removePrefix("bytes=").trim()
+            // Only handle the single "start-end" or "start-" form (most common
+            // case from <audio>/<video> scrubbing). Multi-range is rare.
+            val dash = spec.indexOf('-')
+            if (dash > 0) {
+                start = spec.substring(0, dash).toLongOrNull()
+                end   = spec.substring(dash + 1).toLongOrNull()
+            } else if (dash == 0) {
+                // suffix form "-N" — last N bytes; skip
+            }
+        }
+        return ParsedRequest(method, path, start, end)
+    }
+
+    private fun handle(s: java.net.Socket) {
+        val reader = s.inputStream.bufferedReader(Charsets.ISO_8859_1)
+        val out    = s.outputStream
+        val req = parseRequest(reader) ?: return
+
+        var path = req.path
         if (path == "/" || path.isEmpty()) path = "/index.html"
         val segments = path.trimStart('/').split("/").filter { it.isNotEmpty() && it != ".." }
         val file = resolve(segments)
         when {
             file == null || !file.exists() -> {
                 val idx = resolve(listOf("index.html"))
-                if (idx != null && idx.exists()) serveDocFile(out, idx) else send404(out)
+                if (idx != null && idx.exists()) serveDocFile(out, idx, req)
+                else send404(out)
             }
             file.isDirectory -> {
                 val idx = file.findFile("index.html")
-                if (idx != null) serveDocFile(out, idx) else send404(out)
+                if (idx != null) serveDocFile(out, idx, req) else send404(out)
             }
-            else -> serveDocFile(out, file)
+            else -> serveDocFile(out, file, req)
         }
     }
 
@@ -1516,26 +2086,110 @@ class SimpleServer(
         val ctx = try {
             val f = ContentResolver::class.java.getDeclaredField("mContext")
             f.isAccessible = true
-            f.get(resolver) as android.content.Context
+            f.get(resolver) as Context
         } catch (e: Exception) { return null }
         var node = DocumentFile.fromTreeUri(ctx, rootUri) ?: return null
         for (seg in segments) { node = node.findFile(seg) ?: return null }
         return node
     }
 
-    private fun serveDocFile(out: OutputStream, file: DocumentFile) {
-        val originalBytes = resolver.openInputStream(file.uri)?.use { it.readBytes() }
-            ?: run { send404(out); return }
+    /**
+     * Serve a file. HTML responses get the shim injected. Non-HTML responses
+     * support Range requests so media elements can seek without redownloading.
+     */
+    private fun serveDocFile(out: OutputStream, file: DocumentFile, req: ParsedRequest) {
         val name = file.name ?: ""
         val mime = getMime(name)
+        val totalSize = file.length()
 
-        val bytes = if (mime.startsWith("text/html")) injectShim(originalBytes) else originalBytes
+        if (mime.startsWith("text/html")) {
+            // HTML: read fully, inject shim, send with Content-Length
+            val originalBytes = resolver.openInputStream(file.uri)?.use { it.readBytes() }
+                ?: run { send404(out); return }
+            val bytes = injectShim(originalBytes)
+            if (req.method == "HEAD") {
+                writeHeader(out, 200, "OK", mime, bytes.size.toLong(), null, null)
+                return
+            }
+            writeHeader(out, 200, "OK", mime, bytes.size.toLong(), null, null)
+            out.write(bytes); out.flush()
+            return
+        }
 
-        val header = "HTTP/1.1 200 OK\r\nContent-Type: $mime\r\n" +
-            "Content-Length: ${bytes.size}\r\n" +
-            "Access-Control-Allow-Origin: *\r\nCache-Control: no-cache\r\n\r\n"
-        out.write(header.toByteArray(Charsets.ISO_8859_1))
-        out.write(bytes); out.flush()
+        // HEAD request: headers only, no body
+        if (req.method == "HEAD") {
+            writeHeader(out, 200, "OK", mime, totalSize, null, null)
+            return
+        }
+
+        // Range request: 206 Partial Content with the requested slice
+        if (req.rangeStart != null) {
+            val start = req.rangeStart.coerceAtLeast(0)
+            val end   = (req.rangeEnd ?: (totalSize - 1)).coerceAtMost(totalSize - 1)
+            if (start > end || start >= totalSize) {
+                writeHeader(out, 416, "Range Not Satisfiable", mime, 0, null, totalSize)
+                return
+            }
+            val length = end - start + 1
+            writeHeader(out, 206, "Partial Content", mime, length, start to end, totalSize)
+            // Stream the requested slice
+            resolver.openInputStream(file.uri)?.use { input ->
+                // Skip to start
+                var skipped = 0L
+                val skipBuf = ByteArray(64 * 1024)
+                while (skipped < start) {
+                    val toSkip = minOf(skipBuf.size.toLong(), start - skipped)
+                    val n = input.read(skipBuf, 0, toSkip.toInt())
+                    if (n < 0) break
+                    skipped += n
+                }
+                val buf = ByteArray(64 * 1024)
+                var remaining = length
+                while (remaining > 0) {
+                    val toRead = minOf(buf.size.toLong(), remaining).toInt()
+                    val n = input.read(buf, 0, toRead)
+                    if (n < 0) break
+                    out.write(buf, 0, n)
+                    remaining -= n
+                }
+                out.flush()
+            }
+            return
+        }
+
+        // Normal full GET: stream the whole file, no buffering in memory
+        writeHeader(out, 200, "OK", mime, totalSize, null, null)
+        resolver.openInputStream(file.uri)?.use { input ->
+            val buf = ByteArray(64 * 1024)
+            var n: Int
+            while (input.read(buf).also { n = it } != -1) {
+                out.write(buf, 0, n)
+            }
+            out.flush()
+        }
+    }
+
+    private fun writeHeader(
+        out: OutputStream, code: Int, status: String, mime: String,
+        contentLength: Long, range: Pair<Long, Long>?, totalSize: Long?
+    ) {
+        val sb = StringBuilder()
+        sb.append("HTTP/1.1 ").append(code).append(' ').append(status).append("\r\n")
+        sb.append("Content-Type: ").append(mime).append("\r\n")
+        sb.append("Content-Length: ").append(contentLength).append("\r\n")
+        sb.append("Accept-Ranges: bytes\r\n")
+        sb.append("Access-Control-Allow-Origin: *\r\n")
+        sb.append("Cache-Control: no-cache\r\n")
+        if (range != null && totalSize != null) {
+            sb.append("Content-Range: bytes ")
+              .append(range.first).append('-').append(range.second)
+              .append('/').append(totalSize).append("\r\n")
+        }
+        if (code == 416 && totalSize != null) {
+            sb.append("Content-Range: bytes */").append(totalSize).append("\r\n")
+        }
+        sb.append("\r\n")
+        out.write(sb.toString().toByteArray(Charsets.ISO_8859_1))
     }
 
     private fun injectShim(html: ByteArray): ByteArray {
@@ -1543,18 +2197,29 @@ class SimpleServer(
                    catch (e: Exception) { return html }
 
         val lower = text.lowercase()
-        val headIdx = lower.indexOf("<head")
+
+        // Find the earliest of: end of <head ...>, OR first <script (before
+        // any </head>). The shim must run before any user script.
+        val headIdx     = lower.indexOf("<head")
+        val firstScript = lower.indexOf("<script")
+
+        // Where to insert the shim:
+        //   1. Inside <head> right after its open tag (preferred)
+        //   2. If <script> appears before <head>'s end, inject before that script
+        //   3. If no <head>, build a synthetic <head> containing the shim
         if (headIdx >= 0) {
             val tagEnd = text.indexOf('>', headIdx)
             if (tagEnd > 0) {
+                // Check whether a <script> appears between the doctype and <head>
+                if (firstScript in 0 until headIdx) {
+                    // Inject before that script
+                    val before = text.substring(0, firstScript).toByteArray(Charsets.UTF_8)
+                    val after  = text.substring(firstScript).toByteArray(Charsets.UTF_8)
+                    return concat(before, injectedHead, after)
+                }
                 val before = text.substring(0, tagEnd + 1).toByteArray(Charsets.UTF_8)
                 val after  = text.substring(tagEnd + 1).toByteArray(Charsets.UTF_8)
-                val result = ByteArray(before.size + injectedHead.size + after.size)
-                var offset = 0
-                System.arraycopy(before, 0, result, offset, before.size); offset += before.size
-                System.arraycopy(injectedHead, 0, result, offset, injectedHead.size); offset += injectedHead.size
-                System.arraycopy(after, 0, result, offset, after.size)
-                return result
+                return concat(before, injectedHead, after)
             }
         }
 
@@ -1566,21 +2231,23 @@ class SimpleServer(
                     .toByteArray(Charsets.UTF_8)
                 val before = text.substring(0, tagEnd + 1).toByteArray(Charsets.UTF_8)
                 val after  = text.substring(tagEnd + 1).toByteArray(Charsets.UTF_8)
-                val result = ByteArray(before.size + inject.size + after.size)
-                var offset = 0
-                System.arraycopy(before, 0, result, offset, before.size); offset += before.size
-                System.arraycopy(inject, 0, result, offset, inject.size); offset += inject.size
-                System.arraycopy(after, 0, result, offset, after.size)
-                return result
+                return concat(before, inject, after)
             }
         }
 
         val prefix = ("<head>" + String(injectedHead, Charsets.UTF_8) + "</head>")
             .toByteArray(Charsets.UTF_8)
-        val result = ByteArray(prefix.size + html.size)
-        System.arraycopy(prefix, 0, result, 0, prefix.size)
-        System.arraycopy(html,   0, result, prefix.size, html.size)
-        return result
+        return concat(prefix, html)
+    }
+
+    private fun concat(vararg arrays: ByteArray): ByteArray {
+        val total = arrays.sumOf { it.size }
+        val out = ByteArray(total)
+        var offset = 0
+        for (a in arrays) {
+            System.arraycopy(a, 0, out, offset, a.size); offset += a.size
+        }
+        return out
     }
 
     private fun send404(out: OutputStream) {
@@ -1605,8 +2272,226 @@ class SimpleServer(
         "woff"        -> "font/woff"
         "ttf"         -> "font/ttf"
         "mp4"         -> "video/mp4"
+        "webm"        -> "video/webm"
         "mp3"         -> "audio/mpeg"
+        "wav"         -> "audio/wav"
+        "ogg"         -> "audio/ogg"
+        "m4a"         -> "audio/mp4"
         "wasm"        -> "application/wasm"
         else          -> "application/octet-stream"
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// DebugOverlayActivity — full-screen log viewer with filter chips, Clear/Copy/
+// Share/Save buttons. Renders the DebugLog ring buffer in reverse-chronological
+// order. The "Copy" / "Share" / "Save" buttons output AI-friendly text.
+// ═══════════════════════════════════════════════════════════════════════════════
+class DebugOverlayActivity : AppCompatActivity() {
+
+    private lateinit var listView: RecyclerView
+    private lateinit var emptyText: TextView
+    private lateinit var filterAll: View
+    private lateinit var filterErrors: View
+    private lateinit var filterConsole: View
+    private lateinit var filterBridge: View
+    private lateinit var filterFetch: View
+    private lateinit var filterFs: View
+    private lateinit var btnClear: View
+    private lateinit var btnCopy: View
+    private lateinit var btnShare: View
+    private lateinit var btnSave: View
+    private lateinit var btnClose: View
+
+    private var activeFilter: DebugLog.Source? = null
+    private var errorsOnly = false
+
+    private val tsFmt = SimpleDateFormat("HH:mm:ss.SSS", Locale.US)
+
+    override fun onCreate(savedInstanceState: Bundle?) {
+        super.onCreate(savedInstanceState)
+        WindowCompat.setDecorFitsSystemWindows(window, true)
+        window.statusBarColor     = Color.parseColor("#0F1626")
+        window.navigationBarColor = Color.parseColor("#0F1626")
+        WindowInsetsControllerCompat(window, window.decorView).apply {
+            isAppearanceLightStatusBars = false
+            isAppearanceLightNavigationBars = false
+        }
+
+        supportActionBar?.hide()
+        setContentView(R.layout.activity_debug_overlay)
+
+        listView      = findViewById(R.id.debugList)
+        emptyText     = findViewById(R.id.debugEmpty)
+        filterAll     = findViewById(R.id.filterAll)
+        filterErrors  = findViewById(R.id.filterErrors)
+        filterConsole = findViewById(R.id.filterConsole)
+        filterBridge  = findViewById(R.id.filterBridge)
+        filterFetch   = findViewById(R.id.filterFetch)
+        filterFs      = findViewById(R.id.filterFs)
+        btnClear      = findViewById(R.id.btnClear)
+        btnCopy       = findViewById(R.id.btnCopy)
+        btnShare      = findViewById(R.id.btnShare)
+        btnSave       = findViewById(R.id.btnSave)
+        btnClose      = findViewById(R.id.btnClose)
+
+        listView.layoutManager = LinearLayoutManager(this)
+        refreshList()
+
+        filterAll.setOnClickListener     { activeFilter = null; errorsOnly = false; refreshList() }
+        filterErrors.setOnClickListener  { activeFilter = null; errorsOnly = true;  refreshList() }
+        filterConsole.setOnClickListener { activeFilter = DebugLog.Source.CONSOLE; errorsOnly = false; refreshList() }
+        filterBridge.setOnClickListener  { activeFilter = DebugLog.Source.BRIDGE;  errorsOnly = false; refreshList() }
+        filterFetch.setOnClickListener   { activeFilter = DebugLog.Source.FETCH;   errorsOnly = false; refreshList() }
+        filterFs.setOnClickListener      { activeFilter = DebugLog.Source.FS;      errorsOnly = false; refreshList() }
+
+        btnClear.setOnClickListener {
+            DebugLog.clear()
+            refreshList()
+        }
+        btnCopy.setOnClickListener {
+            val text = DebugLog.renderForAi()
+            copyToClipboard(text)
+            Toast.makeText(this, "Log copied to clipboard", Toast.LENGTH_SHORT).show()
+        }
+        btnShare.setOnClickListener {
+            val text = DebugLog.renderForAi()
+            copyToClipboard(text)
+            startActivity(Intent.createChooser(Intent(Intent.ACTION_SEND).apply {
+                type = "text/plain"
+                putExtra(Intent.EXTRA_TEXT, text)
+                putExtra(Intent.EXTRA_SUBJECT, "CouchFlow debug log")
+            }, "Share debug log"))
+        }
+        btnSave.setOnClickListener { saveLogToDownloads() }
+        btnClose.setOnClickListener { finish() }
+    }
+
+    override fun onResume() { super.onResume(); refreshList() }
+
+    private fun visibleEntries(): List<DebugLog.Entry> {
+        val all = DebugLog.snapshot()
+        val filtered = when {
+            errorsOnly -> all.filter {
+                it.severity == DebugLog.Severity.ERROR ||
+                it.source   == DebugLog.Source.ERROR
+            }
+            activeFilter != null -> all.filter { it.source == activeFilter }
+            else -> all
+        }
+        return filtered.reversed()
+    }
+
+    private fun refreshList() {
+        val entries = visibleEntries()
+        emptyText.visibility = if (entries.isEmpty()) View.VISIBLE else View.GONE
+        listView.adapter = EntryAdapter(entries)
+    }
+
+    private inner class EntryAdapter(val items: List<DebugLog.Entry>) :
+        RecyclerView.Adapter<EntryAdapter.VH>() {
+
+        inner class VH(v: View) : RecyclerView.ViewHolder(v) {
+            val text: TextView = v.findViewById(android.R.id.text1)
+        }
+
+        override fun onCreateViewHolder(parent: ViewGroup, viewType: Int): VH {
+            // Build a simple TextView programmatically to avoid needing yet
+            // another XML file. Monospace, small, generous padding.
+            val tv = TextView(parent.context).apply {
+                id = android.R.id.text1
+                setPadding(24, 12, 24, 12)
+                textSize = 12f
+                typeface = android.graphics.Typeface.MONOSPACE
+                setTextColor(Color.parseColor("#E5E7EB"))
+                setBackgroundColor(Color.TRANSPARENT)
+                layoutParams = ViewGroup.LayoutParams(
+                    ViewGroup.LayoutParams.MATCH_PARENT,
+                    ViewGroup.LayoutParams.WRAP_CONTENT
+                )
+            }
+            return VH(tv)
+        }
+
+        override fun onBindViewHolder(holder: VH, position: Int) {
+            val e = items[position]
+            val ts  = tsFmt.format(Date(e.tsEpochMs))
+            val sev = e.severity.name.padEnd(5)
+            val src = e.source.name.padEnd(9)
+            val color = when (e.severity) {
+                DebugLog.Severity.ERROR -> "#FCA5A5"
+                DebugLog.Severity.WARN  -> "#FCD34D"
+                DebugLog.Severity.INFO  -> "#A7F3D0"
+                DebugLog.Severity.TRACE -> "#9CA3AF"
+            }
+            val srcColor = when (e.source) {
+                DebugLog.Source.BRIDGE    -> "#A78BFA"
+                DebugLog.Source.FS        -> "#7DD3FC"
+                DebugLog.Source.FETCH     -> "#FDBA74"
+                DebugLog.Source.PERM      -> "#F0ABFC"
+                DebugLog.Source.USER      -> "#86EFAC"
+                DebugLog.Source.LIFECYCLE -> "#9CA3AF"
+                DebugLog.Source.AUDIO     -> "#FCD34D"
+                else                      -> "#E5E7EB"
+            }
+            val html = """[$ts] <font color="$color">$sev</font> <font color="$srcColor">$src</font> ${
+                android.text.Html.escapeHtml(e.message)
+            }""".trimIndent()
+            @Suppress("DEPRECATION")
+            holder.text.text = android.text.Html.fromHtml(html)
+        }
+
+        override fun getItemCount(): Int = items.size
+    }
+
+    private fun copyToClipboard(text: String) {
+        val cm = getSystemService(Context.CLIPBOARD_SERVICE) as android.content.ClipboardManager
+        cm.setPrimaryClip(android.content.ClipData.newPlainText("CouchFlow log", text))
+    }
+
+    /**
+     * Save the rendered log to Downloads/CouchFlow/debug-{timestamp}.log via
+     * MediaStore on Android Q+, falling back to direct write on older Androids.
+     * Visible in the system file manager and shareable from there.
+     */
+    private fun saveLogToDownloads() {
+        val text = DebugLog.renderForAi()
+        val ts = SimpleDateFormat("yyyyMMdd-HHmmss", Locale.US).format(Date())
+        val filename = "couchflow-debug-$ts.log"
+
+        try {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                val values = ContentValues().apply {
+                    put(MediaStore.Downloads.DISPLAY_NAME, filename)
+                    put(MediaStore.Downloads.MIME_TYPE, "text/plain")
+                    put(MediaStore.Downloads.RELATIVE_PATH,
+                        "${Environment.DIRECTORY_DOWNLOADS}/CouchFlow")
+                    put(MediaStore.Downloads.IS_PENDING, 1)
+                }
+                val uri = contentResolver.insert(
+                    MediaStore.Downloads.EXTERNAL_CONTENT_URI, values
+                ) ?: throw Exception("MediaStore insert failed")
+                contentResolver.openOutputStream(uri)?.use { out ->
+                    out.write(text.toByteArray(Charsets.UTF_8))
+                }
+                values.clear()
+                values.put(MediaStore.Downloads.IS_PENDING, 0)
+                contentResolver.update(uri, values, null, null)
+                Toast.makeText(this, "Saved to Downloads/CouchFlow/$filename",
+                    Toast.LENGTH_LONG).show()
+            } else {
+                @Suppress("DEPRECATION")
+                val downloadsDir = Environment.getExternalStoragePublicDirectory(
+                    Environment.DIRECTORY_DOWNLOADS
+                )
+                val cfDir = File(downloadsDir, "CouchFlow").also { it.mkdirs() }
+                val file = File(cfDir, filename)
+                file.writeText(text)
+                Toast.makeText(this, "Saved to ${file.absolutePath}",
+                    Toast.LENGTH_LONG).show()
+            }
+        } catch (e: Exception) {
+            Toast.makeText(this, "Save failed: ${e.message}", Toast.LENGTH_LONG).show()
+        }
     }
 }
