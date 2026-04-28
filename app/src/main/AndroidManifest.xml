@@ -51,6 +51,12 @@
             android:theme="@style/Theme.CouchFlow.WebApp"
             android:configChanges="orientation|screenSize|keyboardHidden" />
 
+        <activity
+            android:name=".DebugOverlayActivity"
+            android:exported="false"
+            android:theme="@style/Theme.CouchFlow"
+            android:configChanges="orientation|screenSize|keyboardHidden" />
+
         <provider
             android:name="androidx.core.content.FileProvider"
             android:authorities="${applicationId}.fileprovider"
