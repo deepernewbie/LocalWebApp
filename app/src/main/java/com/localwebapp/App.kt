@@ -20,7 +20,6 @@ import android.provider.MediaStore
 import android.util.Base64
 import android.view.KeyEvent
 import android.view.LayoutInflater
-import android.view.MotionEvent
 import android.view.View
 import android.view.ViewGroup
 import android.view.WindowManager
@@ -1524,7 +1523,6 @@ class WebAppActivity : AppCompatActivity() {
     private lateinit var errorView: View
     private lateinit var errorText: TextView
     private lateinit var debugButton: View
-    private lateinit var debugTopZone: View
 
     private var server: SimpleServer? = null
     private var pendingPermissionRequest: PermissionRequest? = null
@@ -1535,12 +1533,6 @@ class WebAppActivity : AppCompatActivity() {
 
     private val nativeRecorder = NativeAudioRecorder()
     private var fsBridge: JsFilesystemBridge? = null
-
-    // Triple-tap detector for the top edge — opens the debug overlay even when
-    // the persistent debug button is hidden.
-    private val tripleTapTimes = LongArray(3)
-    private var tripleTapIdx = 0
-    private val TRIPLE_TAP_WINDOW_MS = 800L
 
     private val startupPermsLauncher =
         registerForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) { results ->
@@ -1615,7 +1607,6 @@ class WebAppActivity : AppCompatActivity() {
         errorView    = findViewById(R.id.errorView)
         errorText    = findViewById(R.id.errorText)
         debugButton  = findViewById(R.id.debugButton)
-        debugTopZone = findViewById(R.id.debugTopZone)
         progressBar.visibility = View.VISIBLE
 
         // Initialize debug log session metadata
@@ -1628,30 +1619,12 @@ class WebAppActivity : AppCompatActivity() {
         DebugLog.startSession(appTitle, uriStr)
 
         // Persistent debug button — hidden by default. Long-press the FAB on
-        // the home screen to enable.
+        // the home screen to enable. The button itself sits bottom-right
+        // and stays out of the way of the web app's own UI elements.
         val prefs = getSharedPreferences("CouchFlow", MODE_PRIVATE)
         val debugBtnVisible = prefs.getBoolean("debug_button_visible", false)
         debugButton.visibility = if (debugBtnVisible) View.VISIBLE else View.GONE
         debugButton.setOnClickListener { openDebugOverlay() }
-
-        // Top-edge invisible zone for triple-tap. Layout puts it ~36dp tall
-        // across the top, with no background — taps that don't land here
-        // pass through to the WebView normally.
-        debugTopZone.setOnTouchListener { _, ev ->
-            if (ev.action == MotionEvent.ACTION_UP) {
-                tripleTapTimes[tripleTapIdx] = System.currentTimeMillis()
-                tripleTapIdx = (tripleTapIdx + 1) % tripleTapTimes.size
-                val now    = System.currentTimeMillis()
-                val oldest = tripleTapTimes.min()
-                if (oldest > 0 && (now - oldest) < TRIPLE_TAP_WINDOW_MS) {
-                    // Reset so we don't immediately fire again
-                    for (i in tripleTapTimes.indices) tripleTapTimes[i] = 0
-                    openDebugOverlay()
-                    return@setOnTouchListener true
-                }
-            }
-            false
-        }
 
         val neededPerms = mutableListOf<String>()
         if (checkSelfPermission(android.Manifest.permission.RECORD_AUDIO)
