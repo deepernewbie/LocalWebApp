@@ -252,7 +252,8 @@ data class RecentProject(
     val name: String,
     val uri: String,
     val lastOpened: Long,
-    val missing: Boolean = false
+    val missing: Boolean = false,
+    val keepAwake: Boolean = false
 )
 
 class RecentProjectsAdapter(
@@ -260,7 +261,8 @@ class RecentProjectsAdapter(
     private val onOpen:     (RecentProject) -> Unit,
     private val onDelete:   (RecentProject) -> Unit,
     private val onShortcut: (RecentProject) -> Unit,
-    private val onRepick:   (RecentProject) -> Unit
+    private val onRepick:   (RecentProject) -> Unit,
+    private val onLongPress: (RecentProject) -> Unit
 ) : RecyclerView.Adapter<RecentProjectsAdapter.ViewHolder>() {
 
     inner class ViewHolder(view: View) : RecyclerView.ViewHolder(view) {
@@ -279,13 +281,20 @@ class RecentProjectsAdapter(
     override fun onBindViewHolder(holder: ViewHolder, position: Int) {
         val project = projects[position]
         holder.name.text = project.name
+        // Tiny "awake" suffix on the date line is the only visual cue —
+        // keeps the row clean while still letting the user tell at a
+        // glance which projects keep the screen on.
+        val awakeSuffix = if (project.keepAwake) "  ·  ☼ keep awake" else ""
         if (project.missing) {
             holder.date.text = "Folder missing — tap to re-pick"
             holder.itemView.setOnClickListener { onRepick(project) }
         } else {
             val sdf = SimpleDateFormat("MMM dd, yyyy HH:mm", Locale.getDefault())
-            holder.date.text = "Last opened: ${sdf.format(Date(project.lastOpened))}"
+            holder.date.text = "Last opened: ${sdf.format(Date(project.lastOpened))}$awakeSuffix"
             holder.itemView.setOnClickListener { onOpen(project) }
+        }
+        holder.itemView.setOnLongClickListener {
+            onLongPress(project); true
         }
         holder.deleteBtn.setOnClickListener   { onDelete(project) }
         holder.shortcutBtn.setOnClickListener { onShortcut(project) }
@@ -343,14 +352,23 @@ class MainActivity : AppCompatActivity() {
             val uri   = intent.getStringExtra("uri")
             val title = intent.getStringExtra("title") ?: "Web App"
             if (uri != null) {
+                // Look up keepAwake from existing entry (if any) so launcher
+                // shortcuts honor the per-project setting.
+                var keepAwake = false
                 try {
                     val arr = loadJson()
                     val filtered = (0 until arr.length())
                         .map { arr.getJSONObject(it) }
-                        .filter { it.getString("uri") != uri }.toMutableList()
+                        .filter {
+                            if (it.getString("uri") == uri) {
+                                keepAwake = it.optBoolean("keepAwake", false)
+                                false
+                            } else true
+                        }.toMutableList()
                     filtered.add(0, JSONObject().apply {
                         put("name", title); put("uri", uri)
                         put("lastOpened", System.currentTimeMillis())
+                        put("keepAwake", keepAwake)
                     })
                     val out = JSONArray()
                     filtered.take(20).forEach { out.put(it) }
@@ -360,6 +378,7 @@ class MainActivity : AppCompatActivity() {
                 val launchIntent = Intent(this, WebAppActivity::class.java).apply {
                     putExtra(WebAppActivity.EXTRA_URI, uri)
                     putExtra(WebAppActivity.EXTRA_TITLE, title)
+                    putExtra(WebAppActivity.EXTRA_KEEP_AWAKE, keepAwake)
                 }
                 startActivity(launchIntent)
                 finish()
@@ -377,23 +396,24 @@ class MainActivity : AppCompatActivity() {
 
         adapter = RecentProjectsAdapter(
             mutableListOf(),
-            onOpen   = { launchWebApp(Uri.parse(it.uri), it.name) },
+            onOpen   = { launchWebApp(Uri.parse(it.uri), it.name, it.keepAwake) },
             onDelete = {
                 AlertDialog.Builder(this)
                     .setTitle("Remove \"${it.name}\"?")
                     .setPositiveButton("Remove") { _, _ -> removeProject(it.uri) }
                     .setNegativeButton("Cancel", null).show()
             },
-            onShortcut = { createShortcut(it) },
-            onRepick   = { offerRepick(it) }
+            onShortcut  = { createShortcut(it) },
+            onRepick    = { offerRepick(it) },
+            onLongPress = { showProjectMenu(it) }
         )
         recyclerView.layoutManager = LinearLayoutManager(this)
         recyclerView.adapter = adapter
 
         fab.setOnClickListener { openFolderLauncher.launch(null) }
         // Long-press the FAB to toggle the persistent debug button shown
-        // inside web apps. Off by default — triple-tapping the top edge of
-        // any web app also opens the debug overlay.
+        // inside web apps. Off by default — tap the button to open the
+        // debug log overlay from any web app.
         fab.setOnLongClickListener {
             val current = prefs.getBoolean("debug_button_visible", false)
             val next    = !current
@@ -420,12 +440,62 @@ class MainActivity : AppCompatActivity() {
 
     override fun onResume() { super.onResume(); if (::adapter.isInitialized) loadProjects() }
 
-    private fun launchWebApp(uri: Uri, name: String) {
+    private fun launchWebApp(uri: Uri, name: String, keepAwake: Boolean = false) {
         saveProject(name, uri.toString())
         val intent = Intent(this, WebAppActivity::class.java)
         intent.putExtra(WebAppActivity.EXTRA_URI, uri.toString())
         intent.putExtra(WebAppActivity.EXTRA_TITLE, name)
+        intent.putExtra(WebAppActivity.EXTRA_KEEP_AWAKE, keepAwake)
         startActivity(intent)
+    }
+
+    /**
+     * Long-press menu for a project row. Houses per-project settings that
+     * don't fit in the row's button area. Currently:
+     *  - Toggle "keep screen on while running"
+     * As CouchFlow grows, more per-project settings (force orientation,
+     * lock back button, etc) belong here.
+     */
+    private fun showProjectMenu(project: RecentProject) {
+        val keepAwakeLabel = if (project.keepAwake)
+            "Don't keep screen on" else "Keep screen on while running"
+        val items = arrayOf(
+            keepAwakeLabel,
+            "Add home-screen shortcut",
+            "Remove from list"
+        )
+        AlertDialog.Builder(this)
+            .setTitle(project.name)
+            .setItems(items) { _, which ->
+                when (which) {
+                    0 -> {
+                        setProjectKeepAwake(project.uri, !project.keepAwake)
+                        Toast.makeText(this,
+                            if (!project.keepAwake) "Screen will stay on while \"${project.name}\" is open"
+                            else "\"${project.name}\" will allow normal screen sleep",
+                            Toast.LENGTH_SHORT).show()
+                    }
+                    1 -> createShortcut(project)
+                    2 -> AlertDialog.Builder(this)
+                        .setTitle("Remove \"${project.name}\"?")
+                        .setPositiveButton("Remove") { _, _ -> removeProject(project.uri) }
+                        .setNegativeButton("Cancel", null).show()
+                }
+            }
+            .show()
+    }
+
+    private fun setProjectKeepAwake(uriStr: String, value: Boolean) {
+        val arr = loadJson()
+        for (i in 0 until arr.length()) {
+            val o = arr.getJSONObject(i)
+            if (o.getString("uri") == uriStr) {
+                o.put("keepAwake", value)
+                break
+            }
+        }
+        prefs.edit().putString("projects", arr.toString()).apply()
+        loadProjects()
     }
 
     private fun offerRepick(project: RecentProject) {
@@ -492,12 +562,21 @@ class MainActivity : AppCompatActivity() {
 
     private fun saveProject(name: String, uriStr: String) {
         val arr = loadJson()
+        // Preserve keepAwake from the existing entry (if any) — re-opening
+        // a project shouldn't reset its per-project settings.
+        var preservedKeepAwake = false
         val filtered = (0 until arr.length())
             .map { arr.getJSONObject(it) }
-            .filter { it.getString("uri") != uriStr }.toMutableList()
+            .filter {
+                if (it.getString("uri") == uriStr) {
+                    preservedKeepAwake = it.optBoolean("keepAwake", false)
+                    false  // drop, will re-add at top
+                } else true
+            }.toMutableList()
         filtered.add(0, JSONObject().apply {
             put("name", name); put("uri", uriStr)
             put("lastOpened", System.currentTimeMillis())
+            put("keepAwake", preservedKeepAwake)
         })
         val out = JSONArray()
         filtered.take(20).forEach { out.put(it) }
@@ -531,11 +610,12 @@ class MainActivity : AppCompatActivity() {
         val arr = loadJson()
         val list = (0 until arr.length()).map {
             val o = arr.getJSONObject(it)
-            val uri  = o.getString("uri")
-            val name = o.getString("name")
+            val uri    = o.getString("uri")
+            val name   = o.getString("name")
             val opened = o.getLong("lastOpened")
+            val keep   = o.optBoolean("keepAwake", false)
             val missing = !isFolderAccessible(uri)
-            RecentProject(name, uri, opened, missing)
+            RecentProject(name, uri, opened, missing, keep)
         }
         adapter.updateProjects(list)
         emptyView.visibility    = if (list.isEmpty()) View.VISIBLE else View.GONE
@@ -933,13 +1013,15 @@ class JsFilesystemBridge(
 
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// WebAppActivity — fullscreen WebView, edge-respecting layout, debug overlay
+// WebAppActivity — fullscreen WebView, edge-respecting layout, debug overlay,
+// optional keep-screen-on per-project setting via Intent extra.
 // ═══════════════════════════════════════════════════════════════════════════════
 class WebAppActivity : AppCompatActivity() {
 
     companion object {
-        const val EXTRA_URI   = "extra_uri"
-        const val EXTRA_TITLE = "extra_title"
+        const val EXTRA_URI        = "extra_uri"
+        const val EXTRA_TITLE      = "extra_title"
+        const val EXTRA_KEEP_AWAKE = "extra_keep_awake"
         private const val NET_CACHE = "netcache"
 
         // Updated shim adds:
@@ -1601,6 +1683,15 @@ class WebAppActivity : AppCompatActivity() {
         val uriStr = intent.getStringExtra(EXTRA_URI) ?: run { finish(); return }
         folderUri  = Uri.parse(uriStr)
         appTitle   = intent.getStringExtra(EXTRA_TITLE) ?: "Web App"
+
+        // Per-project "keep screen on" — set when the user enables it from
+        // the long-press menu on the home screen. The flag is window-scoped
+        // so it auto-clears when the activity finishes; the next launch
+        // re-reads the per-project setting.
+        if (intent.getBooleanExtra(EXTRA_KEEP_AWAKE, false)) {
+            window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+            DebugLog.lifecycle("keep-screen-on enabled for this session")
+        }
 
         webView      = findViewById(R.id.webView)
         progressBar  = findViewById(R.id.progressBar)
