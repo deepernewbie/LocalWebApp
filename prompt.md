@@ -1,11 +1,3 @@
-# Prompt for writing web apps targeting CouchFlow
-
-Paste this entire document at the top of any AI chat (Claude, ChatGPT,
-whatever) where you want the AI to write a web app that runs inside the
-**CouchFlow** Android APK. Then add your specific app request underneath.
-
----
-
 ## What is CouchFlow?
 
 A tiny Android APK that runs folders full of HTML/JS/CSS as if they were
