@@ -58,6 +58,23 @@ don't invent CouchFlow-specific methods.
   and camera the first time the user opens any web app, before the
   WebView even loads. You still need to feature-detect and handle the
   case where the user denies permission.
+* **Viewport coordinate system**: the WebView is laid out **below** the
+  status bar and **above** the gesture/navigation bar. `y=0` in your
+  CSS coordinates is just below the status bar; `y=viewport.height` is
+  just above the gesture bar. There is **no overlap** between web app
+  content and system UI. As a consequence, `env(safe-area-inset-*)`
+  correctly returns 0 — there is nothing to inset around. Position
+  fixed elements naturally:
+  ```css
+  .topbar  { position: fixed; top:    0; left: 0; right: 0; }
+  .bottom  { position: fixed; bottom: 0; left: 0; right: 0; }
+  ```
+  If you need explicit values for layout calculations, CouchFlow
+  exposes `var(--couchflow-safe-top)`, `var(--couchflow-safe-bottom)`,
+  `var(--couchflow-safe-left)`, `var(--couchflow-safe-right)` on
+  `:root`. All are `0px` in current CouchFlow; if a future version adds
+  edge-to-edge mode, these will reflect the actual inset and your CSS
+  keeps working.
 
 ---
 
@@ -483,9 +500,16 @@ if (inCouchFlow) {
 * Use `touch-action: manipulation` and
   `-webkit-tap-highlight-color: transparent` on tappable elements
 * Use `user-select: none; -webkit-user-select: none` on controls
-* Use `padding-top: env(safe-area-inset-top, 0)` and
-  `padding-bottom: env(safe-area-inset-bottom, 0)` so content respects
-  notches and the gesture bar
+* Use `padding-top: var(--couchflow-safe-top, 0px)` and
+  `padding-bottom: var(--couchflow-safe-bottom, 0px)` only if you need
+  to support a future edge-to-edge mode. **In CouchFlow today both
+  variables are 0** because the WebView is laid out below the status
+  bar and above the gesture bar — there is nothing to inset. **Do NOT
+  use `env(safe-area-inset-top)`** — it correctly reports 0 in
+  CouchFlow's current windowing mode, which can confuse AI tools into
+  hard-coding compensating padding. Just position your topbar at
+  `top: 0` and your bottom UI at `bottom: 0`. The WebView's coordinate
+  system already excludes both system bars.
 
 ---
 
@@ -638,11 +662,10 @@ Example:
 
 ---
 
-*Last updated for CouchFlow shim v6: streaming PUT for large files,
-`navigator.clipboard` patching, dynamic permission re-request,
-`Android.openExternalUrl()`, model cache corruption detection +
-in-overlay clear, plus everything from v5 (in-app debug log overlay,
-`navigator.share` accepts files, `AndroidFS.stat()`, range/HEAD on
-localhost server, capability detection via `LWA.ready`). The doc tracks
-the installed runtime — when CouchFlow gains new capabilities, this
-file is updated in the same commit.*
+*Last updated for CouchFlow shim v6.1: documented viewport coordinate
+system (env(safe-area-inset-*) is 0, use fixed positioning at
+top:0/bottom:0 directly), exposed `--couchflow-safe-*` CSS variables
+for forward compatibility. Plus from v6: streaming PUT, navigator.clipboard
+patching, dynamic permissions, openExternalUrl, cache corruption detection,
+in-overlay clear. The doc tracks the installed runtime — when CouchFlow
+gains new capabilities, this file is updated in the same commit.*
