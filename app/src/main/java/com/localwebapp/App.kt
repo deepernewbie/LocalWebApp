@@ -310,6 +310,174 @@ class RecentProjectsAdapter(
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
+// BackupManager — persists the project list to Downloads/CouchFlow/projects.json
+// so the user's saved web apps survive uninstall + reinstall of CouchFlow.
+//
+// SAF persistable URI permissions are revoked when the package is uninstalled,
+// so the URIs themselves can't be reused — but the project NAME (folder name)
+// is enough for the user to recognise what they had, and re-picking the folder
+// restores the URI permission. When that happens, BackupManager.matchByName()
+// looks up the backup entry by folder name and lets the caller restore other
+// fields like keepAwake automatically.
+// ═══════════════════════════════════════════════════════════════════════════════
+object BackupManager {
+
+    private const val DIR_NAME  = "CouchFlow"
+    private const val FILE_NAME = "projects.json"
+
+    /** A snapshot of one project as stored in the backup file. */
+    data class Entry(
+        val name: String,
+        val uri: String,
+        val lastOpened: Long,
+        val keepAwake: Boolean
+    )
+
+    /**
+     * Write the current project list to Downloads/CouchFlow/projects.json.
+     * Called after every project mutation. Failures are logged and ignored —
+     * the user's primary copy lives in SharedPreferences, the backup is
+     * a convenience for reinstall.
+     */
+    fun write(ctx: Context, projects: List<Entry>) {
+        try {
+            val arr = JSONArray()
+            for (p in projects) {
+                arr.put(JSONObject().apply {
+                    put("name", p.name)
+                    put("uri", p.uri)
+                    put("lastOpened", p.lastOpened)
+                    put("keepAwake", p.keepAwake)
+                })
+            }
+            val text = JSONObject().apply {
+                put("version", 1)
+                put("savedAt", System.currentTimeMillis())
+                put("projects", arr)
+            }.toString(2)
+
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                writeViaMediaStore(ctx, text)
+            } else {
+                @Suppress("DEPRECATION")
+                val downloadsDir = Environment.getExternalStoragePublicDirectory(
+                    Environment.DIRECTORY_DOWNLOADS
+                )
+                val cfDir = File(downloadsDir, DIR_NAME).also { it.mkdirs() }
+                File(cfDir, FILE_NAME).writeText(text)
+            }
+            DebugLog.lifecycle("backup written: ${projects.size} projects")
+        } catch (e: Exception) {
+            DebugLog.error("backup write failed: ${e.message}")
+        }
+    }
+
+    private fun writeViaMediaStore(ctx: Context, text: String) {
+        val resolver = ctx.contentResolver
+        val relPath  = "${Environment.DIRECTORY_DOWNLOADS}/$DIR_NAME"
+
+        // If a previous backup file exists, delete it first — MediaStore
+        // appends rather than overwriting when names collide.
+        val existing = findBackupUri(ctx)
+        if (existing != null) {
+            try { resolver.delete(existing, null, null) } catch (_: Exception) {}
+        }
+
+        val values = ContentValues().apply {
+            put(MediaStore.Downloads.DISPLAY_NAME, FILE_NAME)
+            put(MediaStore.Downloads.MIME_TYPE, "application/json")
+            put(MediaStore.Downloads.RELATIVE_PATH, relPath)
+            put(MediaStore.Downloads.IS_PENDING, 1)
+        }
+        val uri = resolver.insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, values)
+            ?: throw Exception("MediaStore insert returned null")
+        resolver.openOutputStream(uri)?.use { it.write(text.toByteArray(Charsets.UTF_8)) }
+        values.clear()
+        values.put(MediaStore.Downloads.IS_PENDING, 0)
+        resolver.update(uri, values, null, null)
+    }
+
+    /**
+     * Read the backup if it exists. Returns null if the file is missing,
+     * unreadable, or has no projects.
+     */
+    fun read(ctx: Context): List<Entry>? {
+        return try {
+            val text = readBackupText(ctx) ?: return null
+            val obj  = JSONObject(text)
+            val arr  = obj.optJSONArray("projects") ?: return null
+            val out  = mutableListOf<Entry>()
+            for (i in 0 until arr.length()) {
+                val o = arr.getJSONObject(i)
+                out.add(Entry(
+                    name       = o.optString("name", "Web App"),
+                    uri        = o.optString("uri", ""),
+                    lastOpened = o.optLong("lastOpened", 0L),
+                    keepAwake  = o.optBoolean("keepAwake", false)
+                ))
+            }
+            if (out.isEmpty()) null else out
+        } catch (e: Exception) {
+            DebugLog.error("backup read failed: ${e.message}")
+            null
+        }
+    }
+
+    private fun readBackupText(ctx: Context): String? {
+        return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            val uri = findBackupUri(ctx) ?: return null
+            ctx.contentResolver.openInputStream(uri)?.use {
+                it.readBytes().toString(Charsets.UTF_8)
+            }
+        } else {
+            @Suppress("DEPRECATION")
+            val downloadsDir = Environment.getExternalStoragePublicDirectory(
+                Environment.DIRECTORY_DOWNLOADS
+            )
+            val f = File(File(downloadsDir, DIR_NAME), FILE_NAME)
+            if (f.exists()) f.readText() else null
+        }
+    }
+
+    private fun findBackupUri(ctx: Context): Uri? {
+        val resolver  = ctx.contentResolver
+        val projection = arrayOf(MediaStore.Downloads._ID, MediaStore.Downloads.RELATIVE_PATH)
+        val selection  = "${MediaStore.Downloads.DISPLAY_NAME}=?"
+        val args       = arrayOf(FILE_NAME)
+        try {
+            resolver.query(
+                MediaStore.Downloads.EXTERNAL_CONTENT_URI,
+                projection, selection, args, null
+            )?.use { c ->
+                while (c.moveToNext()) {
+                    val relPath = c.getString(c.getColumnIndexOrThrow(MediaStore.Downloads.RELATIVE_PATH))
+                    // Filter to our subfolder — there could be other projects.json
+                    // files elsewhere in Downloads that aren't ours.
+                    if (relPath.contains(DIR_NAME)) {
+                        val id = c.getLong(c.getColumnIndexOrThrow(MediaStore.Downloads._ID))
+                        return android.content.ContentUris.withAppendedId(
+                            MediaStore.Downloads.EXTERNAL_CONTENT_URI, id
+                        )
+                    }
+                }
+            }
+        } catch (_: Exception) {}
+        return null
+    }
+
+    /**
+     * Find a backup entry matching a freshly-picked folder by name.
+     * Returns null if no match. Used to silently restore the keepAwake
+     * setting and the original display name when the user re-picks a
+     * previously-saved folder after reinstall.
+     */
+    fun matchByName(backup: List<Entry>?, folderName: String?): Entry? {
+        if (backup.isNullOrEmpty() || folderName.isNullOrBlank()) return null
+        return backup.firstOrNull { it.name.equals(folderName, ignoreCase = true) }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
 // MainActivity
 // ═══════════════════════════════════════════════════════════════════════════════
 class MainActivity : AppCompatActivity() {
@@ -331,19 +499,95 @@ class MainActivity : AppCompatActivity() {
                     Toast.makeText(this, "Invalid folder", Toast.LENGTH_SHORT).show()
                     return@let
                 }
+                val folderName = docFile.name ?: "Web App"
+
+                // Smart match: if this folder's name matches an existing
+                // project (likely a re-pick after reinstall) OR an entry
+                // in the backup file, restore the original name and the
+                // keepAwake setting silently. The new URI replaces the old
+                // one. The user gets back exactly what they had without
+                // having to remember per-project settings.
+                val existing = matchExistingByName(folderName)
+                val restored = existing?.first  // the RecentProject if found
+                val staleUri = existing?.second // its previous URI (to remove)
+                if (restored != null && staleUri != null) {
+                    // Drop the stale entry and re-add with the new URI.
+                    removeProjectSilently(staleUri)
+                    saveProject(restored.name, treeUri.toString(), restored.keepAwake)
+                    Toast.makeText(this,
+                        "Restored \"${restored.name}\" with previous settings",
+                        Toast.LENGTH_SHORT).show()
+                    launchWebApp(treeUri, restored.name, restored.keepAwake)
+                    return@let
+                }
+
                 if (docFile.findFile("index.html") == null) {
                     AlertDialog.Builder(this)
                         .setTitle("No index.html found")
                         .setMessage("Open anyway?")
                         .setPositiveButton("Open") { _, _ ->
-                            launchWebApp(treeUri, docFile.name ?: "Web App")
+                            launchWebApp(treeUri, folderName)
                         }
                         .setNegativeButton("Cancel", null).show()
                 } else {
-                    launchWebApp(treeUri, docFile.name ?: "Web App")
+                    launchWebApp(treeUri, folderName)
                 }
             }
         }
+
+    /**
+     * Look up an existing project (in current SharedPreferences OR in the
+     * backup file if SharedPreferences has no match) by folder name. Returns
+     * (the project entry, the URI to remove from current list) or null.
+     *
+     * The backup match is what makes "uninstall, reinstall, re-pick folder"
+     * work: the original keepAwake setting and display name carry over even
+     * when the user skipped the restore prompt or hasn't re-picked yet.
+     */
+    private fun matchExistingByName(folderName: String): Pair<RecentProject, String>? {
+        val arr = loadJson()
+        // Look in current list first — covers the regular re-pick flow.
+        for (i in 0 until arr.length()) {
+            val o = arr.getJSONObject(i)
+            if (o.optString("name").equals(folderName, ignoreCase = true)) {
+                val rp = RecentProject(
+                    name       = o.getString("name"),
+                    uri        = o.getString("uri"),
+                    lastOpened = o.optLong("lastOpened", 0L),
+                    missing    = false,
+                    keepAwake  = o.optBoolean("keepAwake", false)
+                )
+                return rp to o.getString("uri")
+            }
+        }
+        // Then check the backup file synchronously — read is cheap.
+        val backup = try { BackupManager.read(applicationContext) } catch (_: Exception) { null }
+        val match = BackupManager.matchByName(backup, folderName)
+        if (match != null) {
+            val rp = RecentProject(
+                name       = match.name,
+                uri        = match.uri,
+                lastOpened = match.lastOpened,
+                missing    = false,
+                keepAwake  = match.keepAwake
+            )
+            // No "stale URI to remove" since this entry isn't in current list.
+            // We pass an empty string so removeProjectSilently is a no-op.
+            return rp to ""
+        }
+        return null
+    }
+
+    private fun removeProjectSilently(uriStr: String) {
+        if (uriStr.isEmpty()) return
+        val arr = loadJson()
+        val filtered = (0 until arr.length())
+            .map { arr.getJSONObject(it) }
+            .filter { it.getString("uri") != uriStr }
+        val out = JSONArray()
+        filtered.forEach { out.put(it) }
+        prefs.edit().putString("projects", out.toString()).apply()
+    }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -436,6 +680,76 @@ class MainActivity : AppCompatActivity() {
         }
 
         loadProjects()
+        maybeOfferBackupRestore()
+    }
+
+    /**
+     * On first launch after install/reinstall, if the project list is empty
+     * and a backup file exists in Downloads/CouchFlow/projects.json, offer
+     * to restore. Shown once per install — once the user picks Restore,
+     * Skip, or adds their first project, this never re-prompts.
+     */
+    private fun maybeOfferBackupRestore() {
+        // Only consider showing if the user has never interacted with this
+        // install (added a project, restored, or skipped before).
+        if (prefs.getBoolean("user_has_interacted", false)) return
+        // And only if the current list is empty.
+        if (loadJson().length() > 0) {
+            markUserHasInteracted()
+            return
+        }
+        // Read the backup off the main thread; show dialog on UI thread.
+        Thread {
+            val backup = BackupManager.read(applicationContext)
+            runOnUiThread {
+                if (backup == null || backup.isEmpty()) {
+                    // No backup found — nothing to do, but mark interacted
+                    // so we don't keep checking on every launch.
+                    markUserHasInteracted()
+                    return@runOnUiThread
+                }
+                val msg = buildString {
+                    appendLine("Found a backup with ${backup.size} project" +
+                        (if (backup.size == 1) "" else "s") + ":")
+                    appendLine()
+                    backup.take(8).forEach { appendLine("  • ${it.name}") }
+                    if (backup.size > 8) appendLine("  • ... and ${backup.size - 8} more")
+                    appendLine()
+                    appendLine("After restoring, each folder needs to be re-picked once " +
+                        "(Android revokes folder permissions on uninstall). Tap " +
+                        "any project marked \"folder missing\" to re-grant access.")
+                }
+                AlertDialog.Builder(this)
+                    .setTitle("Restore projects from backup?")
+                    .setMessage(msg)
+                    .setPositiveButton("Restore") { _, _ ->
+                        restoreFromBackup(backup)
+                        markUserHasInteracted()
+                    }
+                    .setNegativeButton("Skip") { _, _ ->
+                        markUserHasInteracted()
+                    }
+                    .setCancelable(false)
+                    .show()
+            }
+        }.start()
+    }
+
+    private fun restoreFromBackup(entries: List<BackupManager.Entry>) {
+        val out = JSONArray()
+        for (e in entries) {
+            out.put(JSONObject().apply {
+                put("name", e.name); put("uri", e.uri)
+                put("lastOpened", e.lastOpened)
+                put("keepAwake", e.keepAwake)
+            })
+        }
+        prefs.edit().putString("projects", out.toString()).apply()
+        loadProjects()
+        Toast.makeText(this,
+            "Restored ${entries.size} project${if (entries.size == 1) "" else "s"}. " +
+            "Tap each one to re-pick its folder.",
+            Toast.LENGTH_LONG).show()
     }
 
     override fun onResume() { super.onResume(); if (::adapter.isInitialized) loadProjects() }
@@ -496,6 +810,7 @@ class MainActivity : AppCompatActivity() {
         }
         prefs.edit().putString("projects", arr.toString()).apply()
         loadProjects()
+        writeBackup()
     }
 
     private fun offerRepick(project: RecentProject) {
@@ -560,10 +875,11 @@ class MainActivity : AppCompatActivity() {
         return bitmap
     }
 
-    private fun saveProject(name: String, uriStr: String) {
+    private fun saveProject(name: String, uriStr: String, keepAwakeOverride: Boolean? = null) {
         val arr = loadJson()
         // Preserve keepAwake from the existing entry (if any) — re-opening
-        // a project shouldn't reset its per-project settings.
+        // a project shouldn't reset its per-project settings. Caller can
+        // supply an override (used by the re-pick + backup-match flow).
         var preservedKeepAwake = false
         val filtered = (0 until arr.length())
             .map { arr.getJSONObject(it) }
@@ -576,12 +892,14 @@ class MainActivity : AppCompatActivity() {
         filtered.add(0, JSONObject().apply {
             put("name", name); put("uri", uriStr)
             put("lastOpened", System.currentTimeMillis())
-            put("keepAwake", preservedKeepAwake)
+            put("keepAwake", keepAwakeOverride ?: preservedKeepAwake)
         })
         val out = JSONArray()
         filtered.take(20).forEach { out.put(it) }
         prefs.edit().putString("projects", out.toString()).apply()
         if (::adapter.isInitialized) loadProjects()
+        writeBackup()
+        markUserHasInteracted()
     }
 
     private fun removeProject(uriStr: String) {
@@ -593,6 +911,32 @@ class MainActivity : AppCompatActivity() {
         filtered.forEach { out.put(it) }
         prefs.edit().putString("projects", out.toString()).apply()
         if (::adapter.isInitialized) loadProjects()
+        writeBackup()
+    }
+
+    /**
+     * Snapshot the current project list to BackupManager. Called after every
+     * mutation. Idempotent and best-effort — failures don't surface to the
+     * user since the primary copy is in SharedPreferences.
+     */
+    private fun writeBackup() {
+        val arr = loadJson()
+        val list = (0 until arr.length()).map {
+            val o = arr.getJSONObject(it)
+            BackupManager.Entry(
+                name       = o.optString("name", "Web App"),
+                uri        = o.optString("uri", ""),
+                lastOpened = o.optLong("lastOpened", 0L),
+                keepAwake  = o.optBoolean("keepAwake", false)
+            )
+        }
+        Thread { BackupManager.write(applicationContext, list) }.start()
+    }
+
+    /** Set the "user has interacted with this install" flag so we never
+     *  re-prompt for backup restore on the current install. */
+    private fun markUserHasInteracted() {
+        prefs.edit().putBoolean("user_has_interacted", true).apply()
     }
 
     private fun loadJson(): JSONArray {
