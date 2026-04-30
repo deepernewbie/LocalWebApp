@@ -1590,6 +1590,41 @@ class WebAppActivity : AppCompatActivity() {
     if (Android.clearModelCache)  features.push('cache-control');
   }
 
+  // CouchFlow viewport guarantees:
+  //
+  // The WebView is laid out BELOW the status bar and ABOVE the gesture
+  // bar. Web app coordinates (y=0, y=viewport.height) map to the visible
+  // safe area only. There is nothing for content to inset around — env(
+  // safe-area-inset-*) correctly reports 0 because Chromium only fills
+  // those when content draws behind system bars (it doesn't, here).
+  //
+  // We expose CSS custom properties for AI tools and developers who want
+  // explicit values. Both are 0 today; if CouchFlow ever adds an
+  // edge-to-edge fit mode, these will be set to non-zero and existing CSS
+  // keeps working. Recommended pattern:
+  //
+  //   .topbar { padding-top: var(--couchflow-safe-top, 0px); }
+  //
+  // NOT:
+  //   .topbar { padding-top: env(safe-area-inset-top, 0); }
+  //
+  // The first works in CouchFlow today and stays correct under future
+  // windowing changes. The second always returns 0 in the current mode.
+  //
+  // If a web app finds touches in the top strip aren't responding, the
+  // bug is somewhere else (overlapping View, transparent button, OS edge
+  // gesture zone) — not a missing safe-area inset. Use the debug log to
+  // diagnose; never hard-code padding "to compensate".
+  try {
+    var root = document.documentElement;
+    if (root && root.style) {
+      root.style.setProperty('--couchflow-safe-top', '0px');
+      root.style.setProperty('--couchflow-safe-bottom', '0px');
+      root.style.setProperty('--couchflow-safe-left', '0px');
+      root.style.setProperty('--couchflow-safe-right', '0px');
+    }
+  } catch (e) {}
+
   readyResolve({
     features: features.slice(),
     version:  'v6',
@@ -2480,8 +2515,7 @@ class WebAppActivity : AppCompatActivity() {
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // SimpleServer — HTTP server with stable port, HTML shim injection, Range
-// support so <audio> / <video> elements can scrub through media files,
-// and PUT/DELETE so large writes stream straight to disk via SAF.
+// support, and PUT/DELETE so large writes stream straight to disk via SAF.
 // ═══════════════════════════════════════════════════════════════════════════════
 class SimpleServer(
     private val resolver: ContentResolver,
