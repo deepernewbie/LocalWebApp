@@ -57,6 +57,29 @@
             android:theme="@style/Theme.CouchFlow"
             android:configChanges="orientation|screenSize|keyboardHidden" />
 
+        <activity
+            android:name=".NotifSettingsActivity"
+            android:exported="false"
+            android:label="Message capture"
+            android:theme="@style/Theme.CouchFlow"
+            android:configChanges="orientation|screenSize|keyboardHidden" />
+
+        <!--
+            Notification capture. Exported so the system can bind it, but gated
+            by BIND_NOTIFICATION_LISTENER_SERVICE, which only the OS holds — no
+            other app can reach it. Inert until the user grants notification
+            access in Settings and enables capture inside CouchFlow.
+        -->
+        <service
+            android:name=".NotificationCaptureService"
+            android:exported="true"
+            android:label="CouchFlow message capture"
+            android:permission="android.permission.BIND_NOTIFICATION_LISTENER_SERVICE">
+            <intent-filter>
+                <action android:name="android.service.notification.NotificationListenerService" />
+            </intent-filter>
+        </service>
+
         <provider
             android:name="androidx.core.content.FileProvider"
             android:authorities="${applicationId}.fileprovider"
