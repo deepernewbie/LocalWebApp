@@ -5,6 +5,9 @@ on:
     branches: [ main, master ]
   workflow_dispatch:
 
+permissions:
+  contents: write
+
 jobs:
   build:
     runs-on: ubuntu-latest
@@ -34,19 +37,38 @@ jobs:
         with:
           gradle-version: '8.2'
 
-      - name: Generate signing keystore
+      # Prefer the persistent keystore stored in repository secrets. Without it
+      # every build gets a fresh key, Android refuses to install the new APK
+      # over the old one, and the uninstall wipes SharedPreferences, SAF folder
+      # permissions and notification access. Run the "Create signing keystore"
+      # workflow once to set this up.
+      - name: Restore signing keystore
+        env:
+          KEYSTORE_B64: ${{ secrets.KEYSTORE_B64 }}
         run: |
-          keytool -genkey -v \
-            -keystore app/debug.keystore \
-            -storepass android \
-            -alias androiddebugkey \
-            -keypass android \
-            -keyalg RSA \
-            -keysize 2048 \
-            -validity 10000 \
-            -dname "CN=CouchFlow, OU=CouchFlow, O=CouchFlow, L=Couch, S=LR, C=US"
+          if [ -n "$KEYSTORE_B64" ]; then
+            echo "$KEYSTORE_B64" | base64 -d > app/release.keystore
+            echo "Using persistent keystore from secrets."
+            echo "SIGNING_MODE=persistent" >> "$GITHUB_ENV"
+          else
+            echo "::warning::No KEYSTORE_B64 secret. Generating a throwaway key —"
+            echo "::warning::this APK will NOT install over a previous build."
+            keytool -genkeypair -v \
+              -keystore app/release.keystore \
+              -storetype PKCS12 \
+              -storepass android \
+              -keypass android \
+              -alias androiddebugkey \
+              -keyalg RSA -keysize 2048 -validity 10000 \
+              -dname "CN=CouchFlow, OU=CouchFlow, O=CouchFlow, L=Couch, S=LR, C=US"
+            echo "SIGNING_MODE=throwaway" >> "$GITHUB_ENV"
+          fi
 
       - name: Build Release APK
+        env:
+          CF_KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
+          CF_KEY_ALIAS:         ${{ secrets.KEY_ALIAS }}
+          CF_KEY_PASSWORD:      ${{ secrets.KEY_PASSWORD }}
         run: |
           gradle wrapper --gradle-version=8.2
           chmod +x ./gradlew
@@ -63,3 +85,19 @@ jobs:
           name: CouchFlow-release
           path: CouchFlow-*.apk
           retention-days: 30
+
+      # A release gives a direct, tappable APK link — far easier on a phone
+      # than downloading and unzipping an Actions artifact. The "latest" tag
+      # is moved on every build.
+      - name: Publish to "latest" release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: latest
+          name: Latest CouchFlow build
+          body: |
+            Automatic build of `${{ github.sha }}`.
+            Signing: ${{ env.SIGNING_MODE }}
+          files: CouchFlow-*.apk
+          prerelease: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
