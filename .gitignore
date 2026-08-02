@@ -1,0 +1,5 @@
+
+# signing material — never commit
+app/*.keystore
+app/*.jks
+*.b64.txt
