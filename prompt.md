@@ -349,6 +349,84 @@ These work through standard WebView permission prompts:
 
 ---
 
+## Message capture (`inbox/*.jsonl`)
+
+If the user has enabled message capture for this project folder, incoming
+notifications from messaging apps (WhatsApp by default) are written as
+JSONL — one JSON object per line — into:
+
+```
+inbox/YYYY-MM-DD.jsonl
+```
+
+Read them with plain `AndroidFS`. No special API needed:
+
+```
+const today = new Date().toISOString().slice(0, 10);
+const raw   = await AndroidFS.read(`inbox/${today}.jsonl`);
+const msgs  = (raw || '').split('\n')
+  .filter(Boolean)
+  .map(l => { try { return JSON.parse(l); } catch { return null; } })
+  .filter(Boolean);
+```
+
+Each record:
+
+```
+{
+  "ts":     1754130000123,          // epoch ms
+  "iso":    "2026-08-02T12:00:00+03:00",
+  "app":    "whatsapp",
+  "chat":   "Work Group",           // conversation title
+  "sender": "Ahmet",                // "" if unknown; equals chat for 1:1
+  "group":  true,
+  "text":   "can you send the invoice today",
+  "key":    "3f2a91-12"             // dedup key, stable across reposts
+}
+```
+
+**Optional `CouchFlow.messages` API.** Only needed for state that a file
+can't express — always feature-detect, and fall back to reading the files:
+
+```
+const { features } = await window.LWA.ready;
+if (features.includes('messages')) {
+  const st = await CouchFlow.messages.status();
+  // { access, enabled, target, packages, cursor, unread }
+  if (!st.access) {
+    showBanner('Notification access is off', () => CouchFlow.messages.openSettings());
+  }
+
+  // Process only what's new, then advance the cursor.
+  const fresh = await CouchFlow.messages.query(st.cursor, 200);  // newest first
+  if (fresh.length) await CouchFlow.messages.setCursor(fresh[0].ts);
+}
+```
+
+`CouchFlow.messages.flush()` forces an immediate write of today's file into
+the folder; normally this happens automatically ~2s after messages arrive.
+
+**Limits you must design around** — state them in your UI rather than
+pretending they don't exist:
+
+- Only messages that raise a notification are captured. Muted chats, and
+  messages arriving while the messaging app is in the foreground, are missed.
+- No chat history. Capture begins the moment the user switches it on.
+- Long messages may already be truncated by the sending app.
+- Capture is off until the user grants Android notification access, binds a
+  target folder (long-press the project in CouchFlow), and flips the switch.
+  Handle all three states — don't assume an empty `inbox/` means "no messages".
+
+**Replying.** There is no send API, by design. Build a `wa.me` draft and let
+the user press send:
+
+```
+const url = 'https://wa.me/905551112233?text=' + encodeURIComponent(draft);
+Android.openExternalUrl(url);
+```
+
+---
+
 ## Transparent caching of large downloads
 
 CouchFlow automatically caches downloads from common model hosts:
