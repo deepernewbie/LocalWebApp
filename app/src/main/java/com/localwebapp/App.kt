@@ -773,8 +773,13 @@ class MainActivity : AppCompatActivity() {
     private fun showProjectMenu(project: RecentProject) {
         val keepAwakeLabel = if (project.keepAwake)
             "Don't keep screen on" else "Keep screen on while running"
+        val captureLabel = if (NotifStore.targetUri(this) == project.uri)
+            "Message capture (active for this folder)"
+        else
+            "Message capture → this folder"
         val items = arrayOf(
             keepAwakeLabel,
+            captureLabel,
             "Add home-screen shortcut",
             "Remove from list"
         )
@@ -789,8 +794,14 @@ class MainActivity : AppCompatActivity() {
                             else "\"${project.name}\" will allow normal screen sleep",
                             Toast.LENGTH_SHORT).show()
                     }
-                    1 -> createShortcut(project)
-                    2 -> AlertDialog.Builder(this)
+                    1 -> startActivity(
+                        Intent(this, NotifSettingsActivity::class.java).apply {
+                            putExtra(NotifSettingsActivity.EXTRA_TARGET_URI,  project.uri)
+                            putExtra(NotifSettingsActivity.EXTRA_TARGET_NAME, project.name)
+                        }
+                    )
+                    2 -> createShortcut(project)
+                    3 -> AlertDialog.Builder(this)
                         .setTitle("Remove \"${project.name}\"?")
                         .setPositiveButton("Remove") { _, _ -> removeProject(project.uri) }
                         .setNegativeButton("Cancel", null).show()
@@ -1932,6 +1943,30 @@ class WebAppActivity : AppCompatActivity() {
     if (Android.requestPermission) features.push('permissions');
     if (Android.openExternalUrl)  features.push('external-url');
     if (Android.clearModelCache)  features.push('cache-control');
+    if (Android.notifStatus) {
+      features.push('messages');
+      // Promise-shaped wrappers so web-app code reads the same as every other
+      // async API here. Capture itself needs none of this — messages land in
+      // inbox/*.jsonl and AndroidFS reads them like any other file.
+      lwaObj.messages = {
+        status: function() {
+          try { return Promise.resolve(JSON.parse(Android.notifStatus())); }
+          catch (e) { return Promise.reject(e); }
+        },
+        query: function(sinceMs, limit) {
+          try {
+            return Promise.resolve(
+              JSON.parse(Android.notifQuery(String(sinceMs || 0), limit || 200))
+            );
+          } catch (e) { return Promise.reject(e); }
+        },
+        setCursor: function(tsMs) {
+          return Promise.resolve(Android.notifSetCursor(String(tsMs || 0)));
+        },
+        flush:        function() { return Promise.resolve(Android.notifFlush()); },
+        openSettings: function() { return Promise.resolve(Android.notifOpenSettings()); }
+      };
+    }
   }
 
   // CouchFlow viewport guarantees:
@@ -2502,6 +2537,63 @@ class WebAppActivity : AppCompatActivity() {
             @JavascriptInterface fun debugError(msg: String) {
                 DebugLog.error(truncate(msg, 1000))
             }
+
+            // ── Message capture ───────────────────────────────────────────
+            // Captured messages arrive as ordinary files in inbox/, so a web
+            // app can ignore these methods entirely and just use AndroidFS.
+            // They exist for the two things a file can't express: whether
+            // capture is actually switched on, and where the app last read to.
+
+            /** JSON: {access, enabled, target, packages, unread} */
+            @JavascriptInterface fun notifStatus(): String {
+                val ctx = applicationContext
+                val cursor = NotifStore.prefs(ctx).getLong(NotifStore.K_CURSOR, 0L)
+                val json = JSONObject().apply {
+                    put("access",   NotifStore.hasSystemAccess(ctx))
+                    put("enabled",  NotifStore.isCaptureOn(ctx))
+                    put("target",   NotifStore.targetName(ctx))
+                    put("packages", JSONArray(NotifStore.packages(ctx).toList()))
+                    put("cursor",   cursor)
+                    put("unread",   NotifStore.query(ctx, cursor, 500).length())
+                }.toString()
+                DebugLog.bridge("Android.notifStatus", "", "ok")
+                return json
+            }
+
+            /** JSON array of records newer than sinceMs, newest first. */
+            @JavascriptInterface fun notifQuery(sinceMs: String, limit: Int): String {
+                val since = sinceMs.toLongOrNull() ?: 0L
+                val n = limit.coerceIn(1, 1000)
+                val arr = NotifStore.query(applicationContext, since, n)
+                DebugLog.bridge("Android.notifQuery", "since=$since limit=$n", "${arr.length()} rec")
+                return arr.toString()
+            }
+
+            /** Persist the read position so the agent doesn't re-process messages. */
+            @JavascriptInterface fun notifSetCursor(tsMs: String): String {
+                val ts = tsMs.toLongOrNull() ?: return "error:bad ts"
+                NotifStore.prefs(applicationContext).edit()
+                    .putLong(NotifStore.K_CURSOR, ts).apply()
+                DebugLog.bridge("Android.notifSetCursor", "$ts", "ok")
+                return "ok"
+            }
+
+            /** Opens the system notification-access screen. */
+            @JavascriptInterface fun notifOpenSettings(): String {
+                return try {
+                    runOnUiThread {
+                        startActivity(
+                            Intent(android.provider.Settings.ACTION_NOTIFICATION_LISTENER_SETTINGS)
+                                .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                        )
+                    }
+                    "ok"
+                } catch (e: Exception) { "error:${e.message}" }
+            }
+
+            /** Force an immediate mirror of today's messages into the folder. */
+            @JavascriptInterface fun notifFlush(): String =
+                NotifStore.mirror(applicationContext)
         }, "Android")
 
         fsBridge?.let { webView.addJavascriptInterface(it, "AndroidFS_native") }
