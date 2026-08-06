@@ -74,12 +74,16 @@ jobs:
           chmod +x ./gradlew
           ./gradlew assembleRelease --no-daemon
 
-      - name: Rename APK
+      - name: Rename APKs
         run: |
-          cp app/build/outputs/apk/release/CouchFlow-release.apk CouchFlow-${{ github.sha }}.apk 2>/dev/null || \
-          cp app/build/outputs/apk/release/app-release.apk       CouchFlow-${{ github.sha }}.apk
+          SHORT=$(echo "${{ github.sha }}" | cut -c1-7)
+          for f in standard messages; do
+            SRC=$(find app/build/outputs/apk/$f/release -name '*.apk' | head -1)
+            cp "$SRC" "CouchFlow-$f-$SHORT.apk"
+          done
+          ls -la CouchFlow-*.apk
 
-      - name: Upload signed APK
+      - name: Upload signed APKs
         uses: actions/upload-artifact@v4
         with:
           name: CouchFlow-release
@@ -95,8 +99,19 @@ jobs:
           tag_name: latest
           name: Latest CouchFlow build
           body: |
-            Automatic build of `${{ github.sha }}`.
-            Signing: ${{ env.SIGNING_MODE }}
+            Automatic build of `${{ github.sha }}`. Signing: ${{ env.SIGNING_MODE }}
+
+            **CouchFlow-standard** — installs normally. No message capture.
+
+            **CouchFlow-messages** — adds WhatsApp notification capture. Google
+            Play Protect will block the first install ("This app can request
+            access to sensitive data") because it declares a notification
+            listener. Allow it through, then grant notification access under
+            Settings → Apps → CouchFlow → ⋮ → Allow restricted settings.
+
+            Both are signed with the same key and share an applicationId, so
+            you can move between them as an ordinary update without losing
+            projects or folder permissions.
           files: CouchFlow-*.apk
           prerelease: true
         env:
