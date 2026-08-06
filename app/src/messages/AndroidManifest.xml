@@ -1,1 +1,30 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+    Merged in only for the "messages" product flavor.
 
+    Declaring a NOTIFICATION_LISTENER service is what makes Google Play Protect
+    block a sideloaded install ("This app can request access to sensitive data").
+    Keeping the declaration in a flavor manifest means the "standard" APK never
+    contains it and installs normally; only people who actually want WhatsApp
+    capture take the extra steps.
+
+    Exported so the system can bind it, but gated by
+    BIND_NOTIFICATION_LISTENER_SERVICE — a permission only the OS holds, so no
+    other app can reach it. Still inert until the user grants notification
+    access in Settings and switches capture on inside CouchFlow.
+-->
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+    <application>
+        <service
+            android:name=".NotificationCaptureService"
+            android:exported="true"
+            android:label="CouchFlow message capture"
+            android:permission="android.permission.BIND_NOTIFICATION_LISTENER_SERVICE">
+            <intent-filter>
+                <action android:name="android.service.notification.NotificationListenerService" />
+            </intent-filter>
+        </service>
+    </application>
+
+</manifest>
