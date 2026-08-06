@@ -17,6 +17,11 @@
     <uses-feature android:name="android.hardware.microphone" android:required="false" />
     <uses-feature android:name="android.hardware.location" android:required="false" />
 
+    <!-- Ordinary runtime permissions, requested in-app. Not on Play Protect's
+         high-risk list, so these do not affect installability. -->
+    <uses-permission android:name="android.permission.READ_CALENDAR" />
+    <uses-permission android:name="android.permission.WRITE_CALENDAR" />
+
     <application
         android:allowBackup="true"
         android:label="@string/app_name"
@@ -65,20 +70,41 @@
             android:configChanges="orientation|screenSize|keyboardHidden" />
 
         <!--
-            Notification capture. Exported so the system can bind it, but gated
-            by BIND_NOTIFICATION_LISTENER_SERVICE, which only the OS holds — no
-            other app can reach it. Inert until the user grants notification
-            access in Settings and enables capture inside CouchFlow.
+            The notification listener service is NOT declared here. It lives in
+            app/src/messages/AndroidManifest.xml and is merged in only for the
+            "messages" build flavor, so the "standard" APK carries no high-risk
+            permission and installs without a Play Protect block.
         -->
-        <service
-            android:name=".NotificationCaptureService"
+
+        <!--
+            Share target. Puts the app in the system Share sheet so a message,
+            link or note from any app can be handed to the agent. Exported by
+            necessity — that is what being a share target means — but it only
+            ever writes into this app's own folder.
+        -->
+        <activity
+            android:name=".ShareReceiver"
             android:exported="true"
-            android:label="CouchFlow message capture"
-            android:permission="android.permission.BIND_NOTIFICATION_LISTENER_SERVICE">
+            android:label="Yaver"
+            android:excludeFromRecents="true"
+            android:noHistory="true"
+            android:theme="@android:style/Theme.Translucent.NoTitleBar">
             <intent-filter>
-                <action android:name="android.service.notification.NotificationListenerService" />
+                <action android:name="android.intent.action.SEND" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <data android:mimeType="text/*" />
             </intent-filter>
-        </service>
+            <intent-filter>
+                <action android:name="android.intent.action.SEND" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <data android:mimeType="application/pdf" />
+            </intent-filter>
+            <intent-filter>
+                <action android:name="android.intent.action.SEND_MULTIPLE" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <data android:mimeType="text/*" />
+            </intent-filter>
+        </activity>
 
         <provider
             android:name="androidx.core.content.FileProvider"
