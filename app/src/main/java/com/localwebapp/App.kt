@@ -1952,6 +1952,20 @@ class WebAppActivity : AppCompatActivity() {
     if (Android.requestPermission) features.push('permissions');
     if (Android.openExternalUrl)  features.push('external-url');
     if (Android.clearModelCache)  features.push('cache-control');
+    if (typeof AndroidVault !== 'undefined' && AndroidVault.vaultGet) {
+      features.push('vault');
+      lwaObj.vault = {
+        get:    function(key) { try { return Promise.resolve(JSON.parse(AndroidVault.vaultGet(String(key)))); }
+                                catch (e) { return Promise.reject(e); } },
+        set:    function(key, content, savedAt) {
+                  return Promise.resolve(JSON.parse(
+                    AndroidVault.vaultSet(String(key), String(content), String(savedAt || Date.now())))); },
+        list:   function() { return Promise.resolve(JSON.parse(AndroidVault.vaultList())); },
+        remove: function(key) { return Promise.resolve(JSON.parse(AndroidVault.vaultDelete(String(key)))); },
+        size:   function() { return Promise.resolve(JSON.parse(AndroidVault.vaultSize())); }
+      };
+    }
+
     if (typeof AndroidCalendar !== 'undefined' && AndroidCalendar.calendarStatus) {
       features.push('calendar');
       lwaObj.calendar = {
@@ -2649,6 +2663,10 @@ class WebAppActivity : AppCompatActivity() {
         // surface stays separate from the always-available Android bridge.
         calendarBridge = CalendarBridge(this)
         webView.addJavascriptInterface(calendarBridge!!, "AndroidCalendar")
+
+        // App-private store: the only thing that survives picking a different
+        // folder, so settings stop needing to be hand-copied on every update.
+        webView.addJavascriptInterface(VaultBridge(applicationContext), "AndroidVault")
 
         webView.webViewClient = object : WebViewClient() {
             override fun onPageStarted(v: WebView, url: String, f: Bitmap?) {
