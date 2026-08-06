@@ -773,39 +773,48 @@ class MainActivity : AppCompatActivity() {
     private fun showProjectMenu(project: RecentProject) {
         val keepAwakeLabel = if (project.keepAwake)
             "Don't keep screen on" else "Keep screen on while running"
-        val captureLabel = if (NotifStore.targetUri(this) == project.uri)
-            "Message capture (active for this folder)"
-        else
-            "Message capture → this folder"
-        val items = arrayOf(
-            keepAwakeLabel,
-            captureLabel,
-            "Add home-screen shortcut",
-            "Remove from list"
-        )
+        // Built as a list so the message-capture entry can be omitted entirely
+        // in the "standard" flavor, where the listener service isn't compiled
+        // in and the menu item would lead nowhere.
+        val actions = ArrayList<Pair<String, () -> Unit>>()
+
+        actions.add(keepAwakeLabel to {
+            setProjectKeepAwake(project.uri, !project.keepAwake)
+            Toast.makeText(this,
+                if (!project.keepAwake) "Screen will stay on while \"${project.name}\" is open"
+                else "\"${project.name}\" will allow normal screen sleep",
+                Toast.LENGTH_SHORT).show()
+        })
+
+        if (BuildConfig.MESSAGE_CAPTURE) {
+            val captureLabel = if (NotifStore.targetUri(this) == project.uri)
+                "Message capture (active for this folder)"
+            else
+                "Message capture → this folder"
+            actions.add(captureLabel to {
+                startActivity(
+                    Intent(this, NotifSettingsActivity::class.java).apply {
+                        putExtra(NotifSettingsActivity.EXTRA_TARGET_URI,  project.uri)
+                        putExtra(NotifSettingsActivity.EXTRA_TARGET_NAME, project.name)
+                    }
+                )
+            })
+        }
+
+        actions.add("Add home-screen shortcut" to { createShortcut(project) })
+
+        actions.add("Remove from list" to {
+            AlertDialog.Builder(this)
+                .setTitle("Remove \"${project.name}\"?")
+                .setPositiveButton("Remove") { _, _ -> removeProject(project.uri) }
+                .setNegativeButton("Cancel", null).show()
+            Unit
+        })
+
         AlertDialog.Builder(this)
             .setTitle(project.name)
-            .setItems(items) { _, which ->
-                when (which) {
-                    0 -> {
-                        setProjectKeepAwake(project.uri, !project.keepAwake)
-                        Toast.makeText(this,
-                            if (!project.keepAwake) "Screen will stay on while \"${project.name}\" is open"
-                            else "\"${project.name}\" will allow normal screen sleep",
-                            Toast.LENGTH_SHORT).show()
-                    }
-                    1 -> startActivity(
-                        Intent(this, NotifSettingsActivity::class.java).apply {
-                            putExtra(NotifSettingsActivity.EXTRA_TARGET_URI,  project.uri)
-                            putExtra(NotifSettingsActivity.EXTRA_TARGET_NAME, project.name)
-                        }
-                    )
-                    2 -> createShortcut(project)
-                    3 -> AlertDialog.Builder(this)
-                        .setTitle("Remove \"${project.name}\"?")
-                        .setPositiveButton("Remove") { _, _ -> removeProject(project.uri) }
-                        .setNegativeButton("Cancel", null).show()
-                }
+            .setItems(actions.map { it.first }.toTypedArray()) { _, which ->
+                actions[which].second()
             }
             .show()
     }
@@ -1943,7 +1952,23 @@ class WebAppActivity : AppCompatActivity() {
     if (Android.requestPermission) features.push('permissions');
     if (Android.openExternalUrl)  features.push('external-url');
     if (Android.clearModelCache)  features.push('cache-control');
-    if (Android.notifStatus) {
+    if (typeof AndroidCalendar !== 'undefined' && AndroidCalendar.calendarStatus) {
+      features.push('calendar');
+      lwaObj.calendar = {
+        status:  function() { try { return Promise.resolve(JSON.parse(AndroidCalendar.calendarStatus())); }
+                              catch (e) { return Promise.reject(e); } },
+        request: function() { return Promise.resolve(JSON.parse(AndroidCalendar.calendarRequestPermission())); },
+        list:    function(from, to, limit) {
+                   try { return Promise.resolve(JSON.parse(
+                     AndroidCalendar.calendarList(String(from), String(to), limit || 100))); }
+                   catch (e) { return Promise.reject(e); } },
+        create:  function(ev) { return Promise.resolve(JSON.parse(AndroidCalendar.calendarCreate(JSON.stringify(ev)))); },
+        update:  function(ev) { return Promise.resolve(JSON.parse(AndroidCalendar.calendarUpdate(JSON.stringify(ev)))); },
+        remove:  function(id) { return Promise.resolve(JSON.parse(AndroidCalendar.calendarDelete(String(id)))); }
+      };
+    }
+
+    if (Android.notifStatus && Android.notifAvailable && Android.notifAvailable()) {
       features.push('messages');
       // Promise-shaped wrappers so web-app code reads the same as every other
       // async API here. Capture itself needs none of this — messages land in
@@ -2029,6 +2054,25 @@ class WebAppActivity : AppCompatActivity() {
 
     private val nativeRecorder = NativeAudioRecorder()
     private var fsBridge: JsFilesystemBridge? = null
+    private var calendarBridge: CalendarBridge? = null
+
+    /**
+     * The permission dialog is asynchronous, so the page has to be told when
+     * the user answers — otherwise a "grant" button appears to do nothing.
+     */
+    override fun onRequestPermissionsResult(
+        requestCode: Int, permissions: Array<out String>, grantResults: IntArray
+    ) {
+        super.onRequestPermissionsResult(requestCode, permissions, grantResults)
+        if (requestCode != CalendarBridge.REQUEST_CODE) return
+        val ok = grantResults.isNotEmpty() &&
+            grantResults.all { it == android.content.pm.PackageManager.PERMISSION_GRANTED }
+        DebugLog.lifecycle("calendar permission: ${if (ok) "granted" else "denied"}")
+        webView.evaluateJavascript(
+            "window.dispatchEvent(new CustomEvent('calendar-permission'," +
+            "{detail:{granted:$ok}}))", null
+        )
+    }
 
     private val startupPermsLauncher =
         registerForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) { results ->
@@ -2544,6 +2588,9 @@ class WebAppActivity : AppCompatActivity() {
             // They exist for the two things a file can't express: whether
             // capture is actually switched on, and where the app last read to.
 
+            /** False in the "standard" flavor, where no listener is compiled in. */
+            @JavascriptInterface fun notifAvailable(): Boolean = BuildConfig.MESSAGE_CAPTURE
+
             /** JSON: {access, enabled, target, packages, unread} */
             @JavascriptInterface fun notifStatus(): String {
                 val ctx = applicationContext
@@ -2597,6 +2644,11 @@ class WebAppActivity : AppCompatActivity() {
         }, "Android")
 
         fsBridge?.let { webView.addJavascriptInterface(it, "AndroidFS_native") }
+
+        // Real calendar access, on its own object so the permission-guarded
+        // surface stays separate from the always-available Android bridge.
+        calendarBridge = CalendarBridge(this)
+        webView.addJavascriptInterface(calendarBridge!!, "AndroidCalendar")
 
         webView.webViewClient = object : WebViewClient() {
             override fun onPageStarted(v: WebView, url: String, f: Bitmap?) {
