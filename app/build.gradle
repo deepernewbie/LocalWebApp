@@ -11,9 +11,33 @@ android {
         applicationId "com.localwebapp"
         minSdk 26
         targetSdk 34
-        versionCode 3
-        versionName "2.1"
+        versionCode 4
+        versionName "2.2"
         archivesBaseName = "CouchFlow"
+    }
+
+    // Two builds from one codebase.
+    //
+    // "standard" declares no notification listener, so Play Protect installs it
+    // without complaint — the ordinary sideload experience.
+    //
+    // "messages" adds the listener via app/src/messages/AndroidManifest.xml.
+    // Play Protect blocks this one on first install (NOTIFICATION_LISTENER is
+    // on its high-risk list) and it must be allowed through manually.
+    //
+    // Same applicationId and same signing key, so installing "messages" over
+    // "standard" is a normal in-place update: projects, folder permissions and
+    // settings all survive. Going back is equally an update.
+    flavorDimensions "capability"
+    productFlavors {
+        standard {
+            dimension "capability"
+            buildConfigField "boolean", "MESSAGE_CAPTURE", "false"
+        }
+        messages {
+            dimension "capability"
+            buildConfigField "boolean", "MESSAGE_CAPTURE", "true"
+        }
     }
 
     // Signing credentials come from the environment in CI (set by the build
@@ -57,6 +81,7 @@ android {
 
     buildFeatures {
         viewBinding true
+        buildConfig true
     }
 }
 
